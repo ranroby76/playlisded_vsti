@@ -1,0 +1,6 @@
+[submodule "FFmpegVideoComponent"]
+	path = FFmpegVideoComponent
+	url = https://github.com/Cle3000/FFmpegVideoComponent-for-JUCE.git
+[submodule "libs/CLAP_Extensions"]
+	path = libs/CLAP_Extensions
+	url = https://github.com/free-audio/clap-juce-extensions.git

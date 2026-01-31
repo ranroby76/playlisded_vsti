@@ -1,0 +1,1 @@
+Select the version you like and just drag\drop it to your C:\Program Files\Common Files\CLAP or C:\Program Files\Common Files\VST3 folder

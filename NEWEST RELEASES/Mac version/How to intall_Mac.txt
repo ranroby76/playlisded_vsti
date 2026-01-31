@@ -1,0 +1,1 @@
+Select the version you like and just drag & drop it to your /Library/Audio/Plug-Ins/VST3, /Library/Audio/Plug-Ins/Components (for AU), or /Library/Audio/Plug-Ins/CLAP folder

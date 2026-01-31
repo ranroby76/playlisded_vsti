@@ -1,0 +1,4 @@
+appicon.png=256x256
+favicon.ico=128x128
+logo.png-562x244
+On_stage_logo.png=960x148

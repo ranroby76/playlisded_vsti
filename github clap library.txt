@@ -1,0 +1,3 @@
+he link to the GitHub library for the CLAP extensions we integrated is:
+
+https://github.com/free-audio/clap-juce-extensions.git

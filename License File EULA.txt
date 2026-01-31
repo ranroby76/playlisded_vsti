@@ -1,0 +1,29 @@
+EULA - End User License Agreement
+
+License Agreement
+=================
+PLEASE READ THIS LEGAL AGREEMENT CAREFULLY.
+
+The use and redistribution of "Fanan team" ( is subject to the following conditions:
+
+1. All copyrights to the Software are exclusively owned by the Author: "Fanan team".
+
+2. You (the user) have the right to evaluate this Software for the period of 30 days, provided the Software is not used for profit, including but not limited to creating patch libraries and sounds for any pieces you are profiting from. Should you continue use of the Software after your evaluation period expires, or use it for any profit, you shall pay the registration fee.
+
+3. The unregistered demo version of the Software may be freely distributed, with exceptions noted below, provided the distribution package is not modified in any way. No person or company may charge a fee for the distribution of the Software without written permission from the Author. The unregistered demo version of the Software may not be bundled or distributed with any other product without written permission of the Author.
+
+4. Once registered, the user is granted a non-exclusive license to use the Software on ONE computer, for any legal purpose, at a time. The registered Software may not be rented or leased, or given away to the third person, but may be permanently transferred, if the person receiving it agrees to the terms of this License Agreement. If the Software is an update, the transfer must include the update and all previous versions of the Software.
+
+You may not use, copy, emulate, clone, rent, lease, sell, modify, decompile, disassemble, otherwise reverse engineer, or transfer the licensed program, or any subset of the licensed program, except as provided for in this License Agreement. Any such unauthorized use shall result in immediate and automatic termination of this license and may result in criminal and/or civil prosecution.
+
+5. THIS SOFTWARE IS PROVIDED \"AS IS\" WITHOUT WARRANTY OF ANY KIND, EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, NON-INFRINGEMENT OR ARISING FROM A COURSE OF DEALING, USAGE, TRADE OR PRACTICE. Some jurisdictions do not allow the exclusion of implied warranties, so the above disclaimer may not apply to you.
+
+IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+6. Installing and using the Software signifies acceptance of these terms and conditions of this License Agreement.
+
+7. If you do not agree with the terms of this License Agreement you must remove the Software files from your storage devices and cease to use the product.
+
+8. Acknowledgements: VST is a trademark of Steinberg Soft- und Hardware GmbH. All other trademarks and trade names are the properties of their respective owners, and do not imply owner\'s endorsement of this product, or guarantee full compliance with owner\'s standards. 
+
+9. All questions concerning this License Agreement shall be directed to: e-mail: Fananteam@gmail.com

@@ -1,0 +1,26 @@
+# Ignore build output
+build/
+cmake-build-*/
+x64/
+Debug/
+Release/
+*.exe
+*.vst3
+
+# Ignore IDE files
+.vs/
+*.sln
+*.vcxproj
+*.vcxproj.user
+*.jucer
+
+# Ignore large dependencies (The CI downloads these fresh)
+modules/JUCE/
+asiosdk/
+vlc-3.0.21/
+*.zip
+*.7z
+
+# Ignore OS files
+.DS_Store
+Thumbs.db

@@ -1,0 +1,1319 @@
+Let's make a CLAP audio plugin. This tutorial is geared towards people who already have experience writing audio plugins, so I'll be moving pretty fast.
+
+First, grab the SDK. It's header only; feel free to integrate it into your project in whatever way is most convenient for you. The following commands simply copy the headers directly into our project directory.
+
+git clone https://github.com/free-audio/clap.git clap2
+mv clap2/include/clap clap
+rm -rf clap2
+We're going to put our code in plugin.cpp. Here's the compile command for Linux.
+
+g++ -shared -g -Wall -Wextra -Wno-unused-parameter -o ~/.clap/HelloCLAP.clap plugin.cpp
+macOS is similar.
+
+g++ -shared -g -Wall -Wextra --std=gnu++17 -Wno-unused-parameter -o ~/Library/Audio/Plug-Ins/CLAP/HelloCLAP.clap plugin.cpp
+And for Windows, you can run this from a Visual Studio command prompt.
+
+cl /DLL /Zi /std:c++20 plugin.cpp
+Let's start by including some standard headers and the CLAP SDK header, and adding a little dynamic array implementation.
+
+#include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <assert.h>
+#include <math.h>
+
+#include "clap/clap.h"
+
+template <class T>
+struct Array {
+	T *array;
+	size_t length, allocated;
+
+	void Insert(T newItem, uintptr_t index) {
+		if (length + 1 > allocated) {
+			allocated *= 2;
+			if (length + 1 > allocated) allocated = length + 1;
+			array = (T *) realloc(array, allocated * sizeof(T));
+		}
+
+		length++;
+		memmove(array + index + 1, array + index, (length - index - 1) * sizeof(T));
+		array[index] = newItem;
+	}
+
+	void Delete(uintptr_t index) { 
+		memmove(array + index, array + index + 1, (length - index - 1) * sizeof(T)); 
+		length--;
+	}
+
+	void Add(T item) { Insert(item, length); }
+	void Free() { free(array); array = nullptr; length = allocated = 0; }
+	int Length() { return length; }
+	T &operator[](uintptr_t index) { assert(index < length); return array[index]; }
+};
+With that out of the way, we can turn our attention to the structure of a CLAP plugin. We need to export from our shared library a global variable clap_plugin_entry_t clap_entry. This will contain information about the version of the CLAP SDK we're using, and point to information about the shared library's plugin factory. The plugin factory, which we'll be describing in a variable clap_plugin_factory_t pluginFactory, is responsible for listing the plugins inside our shared library. We're only going to have one. The plugin factory will point to the descriptor of our plugin, clap_plugin_descriptor_t pluginDescriptor, and the main plugin class, clap_plugin_t pluginClass. The plugin descriptor contains the basic attributes of the plugin which the host can quickly grab while scanning. The plugin class contains pointers to the functions that actually implement the plugin. There are several of these, the most important being process, which is called by the host to let the plugin process input events and audio data; and the other important function is get_extension, which is where the plugin can advertise support of CLAP extensions.
+
+A diagram repeating the information from the above paragraph.
+
+We begin with the definition of clap_entry. I'm going to be using C++ lambdas to implement the functions inline in the structure definition to help readability, but you could easily have these as standard functions.
+
+extern "C" const clap_plugin_entry_t clap_entry = {
+	.clap_version = CLAP_VERSION_INIT,
+
+	.init = [] (const char *path) -> bool { 
+		return true; 
+	},
+
+	.deinit = [] () {},
+
+	.get_factory = [] (const char *factoryID) -> const void * {
+        // Return a pointer to our pluginFactory definition.
+		return strcmp(factoryID, CLAP_PLUGIN_FACTORY_ID) ? nullptr : &pluginFactory;
+	},
+};
+Next, the plugin factory.
+
+static const clap_plugin_factory_t pluginFactory = {
+	.get_plugin_count = [] (const clap_plugin_factory *factory) -> uint32_t { 
+		return 1; 
+	},
+
+	.get_plugin_descriptor = [] (const clap_plugin_factory *factory, uint32_t index) -> const clap_plugin_descriptor_t * { 
+		// Return a pointer to our pluginDescriptor definition.
+		return index == 0 ? &pluginDescriptor : nullptr; 
+	},
+
+	.create_plugin = [] (const clap_plugin_factory *factory, const clap_host_t *host, const char *pluginID) -> const clap_plugin_t * {
+		if (!clap_version_is_compatible(host->clap_version) || strcmp(pluginID, pluginDescriptor.id)) {
+			return nullptr;
+		}
+
+		// Allocate the plugin structure, and fill in the plugin information from the pluginClass variable.
+		MyPlugin *plugin = (MyPlugin *) calloc(1, sizeof(MyPlugin));
+		plugin->host = host;
+		plugin->plugin = pluginClass;
+		plugin->plugin.plugin_data = plugin;
+		return &plugin->plugin;
+	},
+};
+Oh, and before we forget, let's actually define the MyPlugin structure! We also define the structure we'll use to store active voices.
+
+struct Voice {
+	bool held;
+	int32_t noteID;
+	int16_t channel, key;
+	float phase;
+};
+
+struct MyPlugin {
+	clap_plugin_t plugin;
+	const clap_host_t *host;
+	float sampleRate;
+	Array<Voice> voices;
+};
+Next, we'll define the pluginDescriptor. (Then we've got the pluginClass to do.) In the plugin descriptor, we specify an ID for our plugin; this should be unique to the plugin.
+
+static const clap_plugin_descriptor_t pluginDescriptor = {
+	.clap_version = CLAP_VERSION_INIT,
+	.id = "nakst.HelloCLAP",
+	.name = "HelloCLAP",
+	.vendor = "nakst",
+	.url = "https://nakst.gitlab.io",
+	.manual_url = "https://nakst.gitlab.io",
+	.support_url = "https://nakst.gitlab.io",
+	.version = "1.0.0",
+	.description = "The best audio plugin ever.",
+
+	.features = (const char *[]) {
+		CLAP_PLUGIN_FEATURE_INSTRUMENT,
+		CLAP_PLUGIN_FEATURE_SYNTHESIZER,
+		CLAP_PLUGIN_FEATURE_STEREO,
+		NULL,
+	},
+};
+Now for the pluginClass. There are lot of functions in here, and we're just going to do the simplest implementation of each at first.
+
+static const clap_plugin_t pluginClass = {
+	.desc = &pluginDescriptor,
+	.plugin_data = nullptr,
+
+	.init = [] (const clap_plugin *_plugin) -> bool {
+		MyPlugin *plugin = (MyPlugin *) _plugin->plugin_data;
+		(void) plugin;
+		return true;
+	},
+
+	.destroy = [] (const clap_plugin *_plugin) {
+		MyPlugin *plugin = (MyPlugin *) _plugin->plugin_data;
+		plugin->voices.Free();
+		free(plugin);
+	},
+
+	.activate = [] (const clap_plugin *_plugin, double sampleRate, uint32_t minimumFramesCount, uint32_t maximumFramesCount) -> bool {
+		MyPlugin *plugin = (MyPlugin *) _plugin->plugin_data;
+		plugin->sampleRate = sampleRate;
+		return true;
+	},
+
+	.deactivate = [] (const clap_plugin *_plugin) {
+	},
+
+	.start_processing = [] (const clap_plugin *_plugin) -> bool {
+		return true;
+	},
+
+	.stop_processing = [] (const clap_plugin *_plugin) {
+	},
+
+	.reset = [] (const clap_plugin *_plugin) {
+		MyPlugin *plugin = (MyPlugin *) _plugin->plugin_data;
+		plugin->voices.Free();
+	},
+
+	.process = [] (const clap_plugin *_plugin, const clap_process_t *process) -> clap_process_status {
+		MyPlugin *plugin = (MyPlugin *) _plugin->plugin_data;
+		// TODO.
+		return CLAP_PROCESS_CONTINUE;
+	},
+
+	.get_extension = [] (const clap_plugin *plugin, const char *id) -> const void * {
+		// TODO.
+		return nullptr;
+	},
+
+	.on_main_thread = [] (const clap_plugin *_plugin) {
+	},
+};
+Now we need to implement .process and .get_extension properly. The extensions we'll be implementing are the note ports extension and audio ports extensions. The former will let us receive note on and off events from the host. The latter will let us define an audio port to which we can output sample data. In the .get_extension function, we check the extension id given to us by the host and match it against the extensions we implement.
+
+	.get_extension = [] (const clap_plugin *plugin, const char *id) -> const void * {
+		if (0 == strcmp(id, CLAP_EXT_NOTE_PORTS )) return &extensionNotePorts;
+		if (0 == strcmp(id, CLAP_EXT_AUDIO_PORTS)) return &extensionAudioPorts;
+		return nullptr;
+	},
+The implementation of these extensions is fairly simple. We report that the plugin has one input note port and one output audio port.
+
+static const clap_plugin_note_ports_t extensionNotePorts = {
+	.count = [] (const clap_plugin_t *plugin, bool isInput) -> uint32_t {
+		return isInput ? 1 : 0;
+	},
+
+	.get = [] (const clap_plugin_t *plugin, uint32_t index, bool isInput, clap_note_port_info_t *info) -> bool {
+		if (!isInput || index) return false;
+		info->id = 0;
+		info->supported_dialects = CLAP_NOTE_DIALECT_CLAP; // TODO Also support the MIDI dialect.
+		info->preferred_dialect = CLAP_NOTE_DIALECT_CLAP;
+		snprintf(info->name, sizeof(info->name), "%s", "Note Port");
+		return true;
+	},
+};
+
+static const clap_plugin_audio_ports_t extensionAudioPorts = {
+	.count = [] (const clap_plugin_t *plugin, bool isInput) -> uint32_t { 
+		return isInput ? 0 : 1; 
+	},
+
+	.get = [] (const clap_plugin_t *plugin, uint32_t index, bool isInput, clap_audio_port_info_t *info) -> bool {
+		if (isInput || index) return false;
+		info->id = 0;
+		info->channel_count = 2;
+		info->flags = CLAP_AUDIO_PORT_IS_MAIN;
+		info->port_type = CLAP_PORT_STEREO;
+		info->in_place_pair = CLAP_INVALID_ID;
+		snprintf(info->name, sizeof(info->name), "%s", "Audio Output");
+		return true;
+	},
+};
+Finally, we're ready to implement the .process function of the plugin class. This will be the most complicated. We start by writing two helper functions, one to process a single event sent to the plugin, and another to render a section of audio samples.
+
+We will be processing the note on, off and choke events.
+
+static void PluginProcessEvent(MyPlugin *plugin, const clap_event_header_t *event) {
+	if (event->space_id == CLAP_CORE_EVENT_SPACE_ID) {
+		if (event->type == CLAP_EVENT_NOTE_ON || event->type == CLAP_EVENT_NOTE_OFF || event->type == CLAP_EVENT_NOTE_CHOKE) {
+			const clap_event_note_t *noteEvent = (const clap_event_note_t *) event;
+
+			// Look through our voices array, and if the event matches any of them, it must have been released.
+			for (int i = 0; i < plugin->voices.Length(); i++) {
+				Voice *voice = &plugin->voices[i];
+
+				if ((noteEvent->key == -1 || voice->key == noteEvent->key)
+						&& (noteEvent->note_id == -1 || voice->noteID == noteEvent->note_id)
+						&& (noteEvent->channel == -1 || voice->channel == noteEvent->channel)) {
+					if (event->type == CLAP_EVENT_NOTE_CHOKE) {
+						plugin->voices.Delete(i--); // Stop the voice immediately; don't process the release segment of any ADSR envelopes.
+					} else {
+						voice->held = false;
+					}
+				}
+			}
+
+			// If this is a note on event, create a new voice and add it to our array.
+			if (event->type == CLAP_EVENT_NOTE_ON) {
+				Voice voice = { 
+					.held = true, 
+					.noteID = noteEvent->note_id, 
+					.channel = noteEvent->channel, 
+					.key = noteEvent->key,
+					.phase = 0.0f,
+				};
+
+				plugin->voices.Add(voice);
+			}
+		}
+	}
+}
+To render audio data, we will output a single sine wave for each of the voices.
+
+static void PluginRenderAudio(MyPlugin *plugin, uint32_t start, uint32_t end, float *outputL, float *outputR) {
+	for (uint32_t index = start; index < end; index++) {
+		float sum = 0.0f;
+
+		for (int i = 0; i < plugin->voices.Length(); i++) {
+			Voice *voice = &plugin->voices[i];
+			if (!voice->held) continue;
+			sum += sinf(voice->phase * 2.0f * 3.14159f) * 0.2f;
+			voice->phase += 440.0f * exp2f((voice->key - 57.0f) / 12.0f) / plugin->sampleRate;
+			voice->phase -= floorf(voice->phase);
+		}
+
+		outputL[index] = sum;
+		outputR[index] = sum;
+	}
+}
+Now we actually implement .process. First it will loop over the input events, processing them, as well rendering the necessary audion in between events. Then, for any voices that has completed its lifetime, we will send a note end event to the host.
+
+	.process = [] (const clap_plugin *_plugin, const clap_process_t *process) -> clap_process_status {
+		MyPlugin *plugin = (MyPlugin *) _plugin->plugin_data;
+
+		assert(process->audio_outputs_count == 1);
+		assert(process->audio_inputs_count == 0);
+
+		const uint32_t frameCount = process->frames_count;
+		const uint32_t inputEventCount = process->in_events->size(process->in_events);
+		uint32_t eventIndex = 0;
+		uint32_t nextEventFrame = inputEventCount ? 0 : frameCount;
+
+		for (uint32_t i = 0; i < frameCount; ) {
+			while (eventIndex < inputEventCount && nextEventFrame == i) {
+				const clap_event_header_t *event = process->in_events->get(process->in_events, eventIndex);
+
+				if (event->time != i) {
+					nextEventFrame = event->time;
+					break;
+				}
+
+				PluginProcessEvent(plugin, event);
+				eventIndex++;
+
+				if (eventIndex == inputEventCount) {
+					nextEventFrame = frameCount;
+					break;
+				}
+			}
+
+			PluginRenderAudio(plugin, i, nextEventFrame, process->audio_outputs[0].data32[0], process->audio_outputs[0].data32[1]);
+			i = nextEventFrame;
+		}
+
+		for (int i = 0; i < plugin->voices.Length(); i++) {
+			Voice *voice = &plugin->voices[i];
+
+			if (!voice->held) {
+				clap_event_note_t event = {};
+				event.header.size = sizeof(event);
+				event.header.time = 0;
+				event.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
+				event.header.type = CLAP_EVENT_NOTE_END;
+				event.header.flags = 0;
+				event.key = voice->key;
+				event.note_id = voice->noteID;
+				event.channel = voice->channel;
+				event.port_index = 0;
+				process->out_events->try_push(process->out_events, &event.header);
+
+				plugin->voices.Delete(i--);
+			}
+		}
+
+		return CLAP_PROCESS_CONTINUE;
+	},
+And that's all there is to it! Run the compile command mentioned earlier, and the plugin will load in Bitwig, and on receiving notes it will play sine waves. Awesome!
+
+----------------
+
+Let's add parameters to our plugin. For demonstration purposes we'll only be adding one parameter, volume, but it should be clear how to extend the plugin yourself. We'll support non-destructive polyphonic modulation, as well as synchronizing the parameters between the main and audio threads, so that we can serialize our plugin's state.
+
+We begin by defining a few things: a mutex object, a helper function to clamp a float between 0 and 1, and the enumeration values for our parameters.
+
+#ifdef _WIN32
+#include <windows.h>
+typedef HANDLE Mutex;
+#define MutexAcquire(mutex) WaitForSingleObject(mutex, INFINITE)
+#define MutexRelease(mutex) ReleaseMutex(mutex)
+#define MutexInitialise(mutex) (mutex = CreateMutex(nullptr, FALSE, nullptr))
+#define MutexDestroy(mutex) CloseHandle(mutex)
+#else
+#include <pthread.h>
+typedef pthread_mutex_t Mutex;
+#define MutexAcquire(mutex) pthread_mutex_lock(&(mutex))
+#define MutexRelease(mutex) pthread_mutex_unlock(&(mutex))
+#define MutexInitialise(mutex) pthread_mutex_init(&(mutex), nullptr)
+#define MutexDestroy(mutex) pthread_mutex_destroy(&(mutex))
+#endif
+
+static float FloatClamp01(float x) {
+    return x >= 1.0f ? 1.0f : x <= 0.0f ? 0.0f : x;
+}
+
+// Parameters.
+#define P_VOLUME (0)
+#define P_COUNT (1)
+Although for the sake of simplicity we will use mutex objects for this tutorial, in due course it would be a good idea to replace them with lock-free structures in your codebase.
+
+Next, we update the Voice structure to include an array of parameter offsets specific to that value. The host will send these values to us via events on the audio thread, and we will use them for polyphonic modulation.
+
+struct Voice {
+    bool held;
+    int32_t noteID;
+    int16_t channel, key;
+
+    float phase;
+    float parameterOffsets[P_COUNT]; // New!
+};
+Now we add the arrays of parameters to the MyPlugin structure. We have parameters, the array for the audio thread, and mainParameters, the array for the main thread. We also add two boolean arrays: changed indicating for each parameter whether the value has been changed on the audio thread and needs synchronization to the main thread; and mainChanged for the opposite direction of synchronization. Finally, we add a syncParameters mutex. If a thread wants to write to an array, or read from an array of the opposite thread, they should do so with this mutex acquired.
+
+struct MyPlugin {
+    clap_plugin_t plugin;
+    const clap_host_t *host;
+    float sampleRate;
+    Array<Voice> voices;
+    float parameters[P_COUNT], mainParameters[P_COUNT]; // New!
+    bool changed[P_COUNT], mainChanged[P_COUNT]; // New!
+    Mutex syncParameters; // New!
+};
+With the structures all setup, we can begin modifying the actual plugin code. We start in PluginRenderAudio, where we read the volume parameter. We read from the parameters array in MyPlugin, since we are on the audio thread. We add to this the value in parameterOffsets of the Voice and clamp it, giving the polyphonically modulated value.
+
+static void PluginRenderAudio(MyPlugin *plugin, uint32_t start, uint32_t end, float *outputL, float *outputR) {
+    for (uint32_t index = start; index < end; index++) {
+        float sum = 0.0f;
+
+        for (int i = 0; i < plugin->voices.Length(); i++) {
+            Voice *voice = &plugin->voices[i];
+            if (!voice->held) continue;
+
+            // New!
+            float volume = FloatClamp01(plugin->parameters[P_VOLUME] + voice->parameterOffsets[P_VOLUME]);
+            sum += sinf(voice->phase * 2.0f * 3.14159f) * 0.2f * volume;
+
+            voice->phase += 440.0f * exp2f((voice->key - 57.0f) / 12.0f) / plugin->sampleRate;
+            voice->phase -= floorf(voice->phase);
+        }
+
+        outputL[index] = sum;
+        outputR[index] = sum;
+    }
+}
+Next, we update PluginProcessEvent to handle the CLAP_EVENT_PARAM_VALUE and CLAP_EVENT_PARAM_MOD events. The former is sent when the host wants to change the actual value of a parameter; for example, when the user modifies a dial for one of the plugin's parameters in the host's UI. The latter is sent for polyphonic modulation; the event specifies a voice or set of voices to which the parameter offset applies.
+
+For the CLAP_EVENT_PARAM_VALUE, we store the value into the parameters array (since we are on the audio thread), and mark the corresponding changed boolean, so that the main thread knows the audio thread wants to update the value. We make sure that the operation is done under lock of the syncParameters mutex, since we are modifying the arrays.
+
+if (event->type == CLAP_EVENT_PARAM_VALUE) {
+    const clap_event_param_value_t *valueEvent = (const clap_event_param_value_t *) event;
+    uint32_t i = (uint32_t) valueEvent->param_id;
+    MutexAcquire(plugin->syncParameters);
+    plugin->parameters[i] = valueEvent->value;
+    plugin->changed[i] = true;
+    MutexRelease(plugin->syncParameters);
+}
+For the CLAP_EVENT_PARAM_MOD, we iterate through the voices, and for any that match the query, we update the parameter offset. Since this is non-destructive modulation, the main thread doesn't need to know about this, since it won't be using the values for serialization.
+
+if (event->type == CLAP_EVENT_PARAM_MOD) {
+    const clap_event_param_mod_t *modEvent = (const clap_event_param_mod_t *) event;
+
+    for (int i = 0; i < plugin->voices.Length(); i++) {
+        Voice *voice = &plugin->voices[i];
+
+        if ((modEvent->key == -1 || voice->key == modEvent->key)
+                && (modEvent->note_id == -1 || voice->noteID == modEvent->note_id)
+                && (modEvent->channel == -1 || voice->channel == modEvent->channel)) {
+            voice->parameterOffsets[modEvent->param_id] = modEvent->amount;
+            break;
+        }
+    }
+}
+Let us now take the opportunity to initialize the parameter arrays and the mutex. In pluginClass.init, we add the following code:
+
+.init = [] (const clap_plugin *_plugin) -> bool {
+    MyPlugin *plugin = (MyPlugin *) _plugin->plugin_data;
+
+    MutexInitialise(plugin->syncParameters);
+
+    for (uint32_t i = 0; i < P_COUNT; i++) {
+        clap_param_info_t information = {};
+        extensionParams.get_info(_plugin, i, &information);
+        plugin->mainParameters[i] = plugin->parameters[i] = information.default_value;
+    }
+
+    return true;
+}
+We have not defined extensionParams yet, but we will soon enough. And in pluginClass.destroy, we add the code to destroy the mutex:
+
+.destroy = [] (const clap_plugin *_plugin) {
+    MyPlugin *plugin = (MyPlugin *) _plugin->plugin_data;
+    plugin->voices.Free();
+    MutexDestroy(plugin->syncParameters);
+    free(plugin);
+}
+We're going to implementing two new extensions, the parameters extension and the state extension. Before we can get there though, we need to add functions to synchronize parameters from the main thread to the audio thread and another for the opposite direction. These functions work under thelock of the syncParameters mutex since they will be reading from the arrays owned by the opposite thread as well as modifying their own arrays.
+
+To synchronize from the main thread to audio thread, for each of the changed parameters, we copy the new parameter value over and then construct a CLAP_EVENT_PARAM_VALUE event to send to the host. The event is pushed to a clap_output_events_t structure. Note that we also processing incoming CLAP_EVENT_PARAM_VALUE events from the host; it works very similar in the direction from the plugin to the host.
+
+static void PluginSyncMainToAudio(MyPlugin *plugin, const clap_output_events_t *out) {
+    MutexAcquire(plugin->syncParameters);
+
+    for (uint32_t i = 0; i < P_COUNT; i++) {
+        if (plugin->mainChanged[i]) {
+            plugin->parameters[i] = plugin->mainParameters[i];
+            plugin->mainChanged[i] = false;
+
+            clap_event_param_value_t event = {};
+            event.header.size = sizeof(event);
+            event.header.time = 0;
+            event.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
+            event.header.type = CLAP_EVENT_PARAM_VALUE;
+            event.header.flags = 0;
+            event.param_id = i;
+            event.cookie = NULL;
+            event.note_id = -1;
+            event.port_index = -1;
+            event.channel = -1;
+            event.key = -1;
+            event.value = plugin->parameters[i];
+            out->try_push(out, &event.header);
+        }
+    }
+
+    MutexRelease(plugin->syncParameters);
+}
+To synchronize from the audio thread to the main thread, there is less to do. We only need to copy the new values into the array. We also compute a boolean indicating whether any parameter had changed during the call; this will be useful later when we implement a GUI.
+
+static bool PluginSyncAudioToMain(MyPlugin *plugin) {
+    bool anyChanged = false;
+    MutexAcquire(plugin->syncParameters);
+
+    for (uint32_t i = 0; i < P_COUNT; i++) {
+        if (plugin->changed[i]) {
+            plugin->mainParameters[i] = plugin->parameters[i];
+            plugin->changed[i] = false;
+            anyChanged = true;
+        }
+    }
+
+    MutexRelease(plugin->syncParameters);
+    return anyChanged;
+}
+With these functions in place, we're almost ready to implement the new extension. But first let's make sure that the PluginSyncMainToAudio function is called in pluginClass.process:
+
+.process = [] (const clap_plugin *_plugin, const clap_process_t *process) -> clap_process_status {
+    MyPlugin *plugin = (MyPlugin *) _plugin->plugin_data;
+
+    PluginSyncMainToAudio(plugin, process->out_events);
+
+    // ... as before ...
+
+    return CLAP_PROCESS_CONTINUE;
+}
+Finally, we can begin work on the extensions. First, the parameters extension. This tells the host about the properties of our parameters (.count, .get_info), gives it a way to query the current value of parameters (.get_value), gives it a way to transform values to and from text (.value_to_text, .text_to_value), and also provides a mechanism for parameter synchronization when the plugin isn't processing audio (.flush).
+
+static const clap_plugin_params_t extensionParams = {
+    .count = [] (const clap_plugin_t *plugin) -> uint32_t {
+        return P_COUNT;
+    },
+
+    .get_info = [] (const clap_plugin_t *_plugin, uint32_t index, clap_param_info_t *information) -> bool {
+        if (index == P_VOLUME) {
+            memset(information, 0, sizeof(clap_param_info_t));
+            information->id = index;
+            // These flags enable polyphonic modulation.
+            information->flags = CLAP_PARAM_IS_AUTOMATABLE | CLAP_PARAM_IS_MODULATABLE | CLAP_PARAM_IS_MODULATABLE_PER_NOTE_ID;
+            information->min_value = 0.0f;
+            information->max_value = 1.0f;
+            information->default_value = 0.5f;
+            strcpy(information->name, "Volume");
+            return true;
+        } else {
+            return false;
+        }
+    },
+
+    .get_value = [] (const clap_plugin_t *_plugin, clap_id id, double *value) -> bool {
+        MyPlugin *plugin = (MyPlugin *) _plugin->plugin_data;
+        uint32_t i = (uint32_t) id;
+        if (i >= P_COUNT) return false;
+
+        // get_value is called on the main thread, but should return the value of the parameter according to the audio thread,
+        // since the value on the audio thread is the one that host communicates with us via CLAP_EVENT_PARAM_VALUE events.
+        // Since we're accessing the opposite thread's arrays, we must acquire the syncParameters mutex.
+        // And although we need to check the mainChanged array, we mustn't actually modify the parameters array,
+        // since that can only be done on the audio thread. Don't worry -- it'll pick up the changes eventually.
+        MutexAcquire(plugin->syncParameters);
+        *value = plugin->mainChanged[i] ? plugin->mainParameters[i] : plugin->parameters[i];
+        MutexRelease(plugin->syncParameters);
+        return true;
+    },
+
+    .value_to_text = [] (const clap_plugin_t *_plugin, clap_id id, double value, char *display, uint32_t size) {
+        uint32_t i = (uint32_t) id;
+        if (i >= P_COUNT) return false;
+        snprintf(display, size, "%f", value);
+        return true;
+    },
+
+    .text_to_value = [] (const clap_plugin_t *_plugin, clap_id param_id, const char *display, double *value) {
+        // TODO Implement this.
+        return false;
+    },
+
+    .flush = [] (const clap_plugin_t *_plugin, const clap_input_events_t *in, const clap_output_events_t *out) {
+        MyPlugin *plugin = (MyPlugin *) _plugin->plugin_data;
+        const uint32_t eventCount = in->size(in);
+
+        // For parameters that have been modified by the main thread, send CLAP_EVENT_PARAM_VALUE events to the host.
+        PluginSyncMainToAudio(plugin, out);
+
+        // Process events sent to our plugin from the host.
+        for (uint32_t eventIndex = 0; eventIndex < eventCount; eventIndex++) {
+            PluginProcessEvent(plugin, in->get(in, eventIndex));
+        }
+    },
+};
+The other extension is the state extension. This lets our plugin save and restore its state. We assume that the stream accessor functions won't result in short reads or writes, but this is not guaranteed; in a production plugin, you should modify these implementation to handle short reads and writes.
+
+static const clap_plugin_state_t extensionState = {
+    .save = [] (const clap_plugin_t *_plugin, const clap_ostream_t *stream) -> bool {
+        MyPlugin *plugin = (MyPlugin *) _plugin->plugin_data;
+
+        // Synchronize any changes from the audio thread (that is, parameter values sent to us by the host)
+        // before we save the state of the plugin.
+        PluginSyncAudioToMain(plugin);
+
+        return sizeof(float) * P_COUNT == stream->write(stream, plugin->mainParameters, sizeof(float) * P_COUNT);
+    },
+
+    .load = [] (const clap_plugin_t *_plugin, const clap_istream_t *stream) -> bool {
+        MyPlugin *plugin = (MyPlugin *) _plugin->plugin_data;
+
+        // Since we're modifying a parameter array, we need to acquire the syncParameters mutex.
+        MutexAcquire(plugin->syncParameters);
+        bool success = sizeof(float) * P_COUNT == stream->read(stream, plugin->mainParameters, sizeof(float) * P_COUNT);
+        // Make sure that the audio thread will pick up upon the modified parameters next time pluginClass.process is called.
+        for (uint32_t i = 0; i < P_COUNT; i++) plugin->mainChanged[i] = true;
+        MutexRelease(plugin->syncParameters);
+
+        return success;
+    },
+};
+Finally, we must update pluginClass.get_extension to include the new extensions we've implemented.
+
+.get_extension = [] (const clap_plugin *plugin, const char *id) -> const void * {
+    if (0 == strcmp(id, CLAP_EXT_NOTE_PORTS )) return &extensionNotePorts;
+    if (0 == strcmp(id, CLAP_EXT_AUDIO_PORTS)) return &extensionAudioPorts;
+    if (0 == strcmp(id, CLAP_EXT_PARAMS     )) return &extensionParams; // New!
+    if (0 == strcmp(id, CLAP_EXT_STATE      )) return &extensionState; // New!
+    return nullptr;
+},
+Fantastic, we've now got parameters support in our plugin. Recompile and load it in Bitwig. You should be able to assign modulators to the volume parameter and try out polyphonic modulation!
+
+----------------
+
+We're going to add a GUI to our plugin. Start by defining the size of the GUI and creating some stubs we'll fill out later in the tutorial.
+
+// GUI size.
+#define GUI_WIDTH (300)
+#define GUI_HEIGHT (200)
+
+static void PluginPaint(MyPlugin *plugin, uint32_t *bits) {
+    // TODO.
+}
+
+static void PluginProcessMouseDrag(MyPlugin *plugin, int32_t x, int32_t y) {
+    // TODO.
+}
+
+static void PluginProcessMousePress(MyPlugin *plugin, int32_t x, int32_t y) {
+    // TODO.
+}
+
+static void PluginProcessMouseRelease(MyPlugin *plugin) {
+    // TODO.
+}
+Let's also include a platform-specific file where we can put our GUI code. I'm going for a unity build here, but you could easily compile this as a separate translation unit.
+
+#if defined(_WIN32)
+#include "gui_w32.cpp"
+#elif defined(__linux__)
+#include "gui_x11.cpp"
+#elif defined(__APPLE__)
+#include "gui_mac.cpp"
+#endif
+We'll be implementing two new extensions, the GUI extension and the POSIX FD support extension. The latter will only be used on Linux, but it doesn't hurt to have it around on other platforms, AFAIK.
+
+To our MyPlugin structure, add two fields, one for storing the GUI data, and another for storing the host's implementation of the POSIX FD support extension.
+
+struct MyPlugin {
+    clap_plugin_t plugin;
+    const clap_host_t *host;
+    float sampleRate;
+    Array<Voice> voices;
+    float parameters[P_COUNT], mainParameters[P_COUNT];
+    bool changed[P_COUNT], mainChanged[P_COUNT];
+    Mutex syncParameters;
+    struct GUI *gui; // New!
+    const clap_host_posix_fd_support_t *hostPOSIXFDSupport; // New!
+};
+In pluginClass.init, query the host for its implementation of the POSIX FD support extension. If this returns a non-null pointer, we'll be able to call into the function pointers in the structure. We'll talk about this when we get to the X11/Linux GUI specifics.
+
+        MyPlugin *plugin = (MyPlugin *) _plugin->plugin_data;
+
+        plugin->hostPOSIXFDSupport = (const clap_host_posix_fd_support_t *) plugin->host->get_extension(plugin->host, CLAP_EXT_POSIX_FD_SUPPORT);
+
+        // ... as before
+Next, in pluginClass.get_extension return the pointers to the extensions we're about to implement.
+
+    .get_extension = [] (const clap_plugin *plugin, const char *id) -> const void * {
+        if (0 == strcmp(id, CLAP_EXT_NOTE_PORTS      )) return &extensionNotePorts;
+        if (0 == strcmp(id, CLAP_EXT_AUDIO_PORTS     )) return &extensionAudioPorts;
+        if (0 == strcmp(id, CLAP_EXT_PARAMS          )) return &extensionParams;
+        if (0 == strcmp(id, CLAP_EXT_STATE           )) return &extensionState;
+        if (0 == strcmp(id, CLAP_EXT_GUI             )) return &extensionGUI; // New!
+        if (0 == strcmp(id, CLAP_EXT_POSIX_FD_SUPPORT)) return &extensionPOSIXFDSupport; // New!
+        return nullptr;
+    },
+First, let's do the POSIX fd suport extension since it's only small. Again, we'll discuss what this is for when we're covering the X11/Linux GUI code specifics.
+
+static const clap_plugin_posix_fd_support_t extensionPOSIXFDSupport = {
+    .on_fd = [] (const clap_plugin_t *_plugin, int fd, clap_posix_fd_flags_t flags) {
+        MyPlugin *plugin = (MyPlugin *) _plugin->plugin_data;
+        // We'll define GUIOnPOSIXFD in our platform specific code file.
+        GUIOnPOSIXFD(plugin);
+    },
+};
+And now for the GUI extension. This is another fairly large extension, but we only need to implement most of the functions in the simplest possible way. This code will call out to various functions from the platform specific code we're going to write next.
+
+static const clap_plugin_gui_t extensionGUI = {
+    .is_api_supported = [] (const clap_plugin_t *plugin, const char *api, bool isFloating) -> bool {
+        // We'll define GUI_API in our platform specific code file.
+        return 0 == strcmp(api, GUI_API) && !isFloating;
+    },
+
+    .get_preferred_api = [] (const clap_plugin_t *plugin, const char **api, bool *isFloating) -> bool {
+        *api = GUI_API;
+        *isFloating = false;
+        return true;
+    },
+
+    .create = [] (const clap_plugin_t *_plugin, const char *api, bool isFloating) -> bool {
+        if (!extensionGUI.is_api_supported(_plugin, api, isFloating)) return false;
+        // We'll define GUICreate in our platform specific code file.
+        GUICreate((MyPlugin *) _plugin->plugin_data);
+        return true;
+    },
+
+    .destroy = [] (const clap_plugin_t *_plugin) {
+        // We'll define GUIDestroy in our platform specific code file.
+        GUIDestroy((MyPlugin *) _plugin->plugin_data);
+    },
+
+    .set_scale = [] (const clap_plugin_t *plugin, double scale) -> bool {
+        return false;
+    },
+
+    .get_size = [] (const clap_plugin_t *plugin, uint32_t *width, uint32_t *height) -> bool {
+        *width = GUI_WIDTH;
+        *height = GUI_HEIGHT;
+        return true;
+    },
+
+    .can_resize = [] (const clap_plugin_t *plugin) -> bool {
+        return false;
+    },
+
+    .get_resize_hints = [] (const clap_plugin_t *plugin, clap_gui_resize_hints_t *hints) -> bool {
+        return false;
+    },
+
+    .adjust_size = [] (const clap_plugin_t *plugin, uint32_t *width, uint32_t *height) -> bool {
+        return extensionGUI.get_size(plugin, width, height);
+    },
+
+    .set_size = [] (const clap_plugin_t *plugin, uint32_t width, uint32_t height) -> bool {
+        return true;
+    },
+
+    .set_parent = [] (const clap_plugin_t *_plugin, const clap_window_t *window) -> bool {
+        assert(0 == strcmp(window->api, GUI_API));
+        // We'll define GUISetParent in our platform specific code file.
+        GUISetParent((MyPlugin *) _plugin->plugin_data, window);
+        return true;
+    },
+
+    .set_transient = [] (const clap_plugin_t *plugin, const clap_window_t *window) -> bool {
+        return false;
+    },
+
+    .suggest_title = [] (const clap_plugin_t *plugin, const char *title) {
+    },
+
+    .show = [] (const clap_plugin_t *_plugin) -> bool {
+        // We'll define GUISetVisible in our platform specific code file.
+        GUISetVisible((MyPlugin *) _plugin->plugin_data, true);
+        return true;
+    },
+
+    .hide = [] (const clap_plugin_t *_plugin) -> bool {
+        GUISetVisible((MyPlugin *) _plugin->plugin_data, false);
+        return true;
+    },
+};
+Okay, we're ready for the platform specific code!
+
+X11/Linux
+To your compile command, append -lX11.
+
+We now write gui_x11.cpp. We begin by defining the GUI_API constant, including some header files and defining the GUI structure that's part of MyPlugin.
+
+#define GUI_API CLAP_WINDOW_API_X11
+
+#include <X11/Xlib.h>
+#include <X11/Xutil.h>
+#include <X11/Xatom.h>
+
+struct GUI {
+    Display *display;
+    Window window;
+    XImage *image;
+    uint32_t *bits;
+};
+To create the GUI, there are a few steps. First, we allocate a GUI structure. Then, we open an X11 display and a window in it. Next, we set the _XEMBED_INFO atom so that the window we embed correctly in the host. Then, we set the window's size and select the input events the window receives. Next, the bitmap to paint on is allocated. Finally, we register the file descriptor that the X11 display gets events from with the host, via the POSIX FD support extension. The host will call extensionPOSIXFDSupport.on_fd when events are ready, which we're redirecting to GUIOnPOSIXFD.
+
+static void GUICreate(MyPlugin *plugin) {
+    // Allocate the GUI pointer.
+    assert(!plugin->gui);
+    plugin->gui = (GUI *) calloc(1, sizeof(GUI));
+
+    // Open the display and window.
+    plugin->gui->display = XOpenDisplay(NULL);
+    XSetWindowAttributes attributes = {};
+    plugin->gui->window = XCreateWindow(plugin->gui->display, DefaultRootWindow(plugin->gui->display), 0, 0, GUI_WIDTH, GUI_HEIGHT, 0, 0, 
+            InputOutput, CopyFromParent, CWOverrideRedirect, &attributes);
+    XStoreName(plugin->gui->display, plugin->gui->window, pluginDescriptor.name);
+
+    // Set embed information for the window.
+    Atom embedInfoAtom = XInternAtom(plugin->gui->display, "_XEMBED_INFO", 0);
+    uint32_t embedInfoData[2] = { 0 /* version */, 0 /* not mapped */ };
+    XChangeProperty(plugin->gui->display, plugin->gui->window, embedInfoAtom, embedInfoAtom, 32, PropModeReplace, (uint8_t *) embedInfoData, 2);
+
+    // Set the size of the window.
+    XSizeHints sizeHints = {};
+    sizeHints.flags = PMinSize | PMaxSize; 
+    sizeHints.min_width = sizeHints.max_width = GUI_WIDTH;
+    sizeHints.min_height = sizeHints.max_height = GUI_HEIGHT;
+    XSetWMNormalHints(plugin->gui->display, plugin->gui->window, &sizeHints);
+
+    // Select the events the window will receive.
+    XSelectInput(plugin->gui->display, plugin->gui->window, SubstructureNotifyMask | ExposureMask | PointerMotionMask 
+            | ButtonPressMask | ButtonReleaseMask | KeyPressMask | KeyReleaseMask | StructureNotifyMask
+            | EnterWindowMask | LeaveWindowMask | ButtonMotionMask | KeymapStateMask | FocusChangeMask | PropertyChangeMask);
+
+    // Create the bitmap to paint on.
+    plugin->gui->image = XCreateImage(plugin->gui->display, DefaultVisual(plugin->gui->display, 0), 24, ZPixmap, 0, NULL, 10, 10, 32, 0);
+    plugin->gui->bits = (uint32_t *) calloc(1, GUI_WIDTH * GUI_HEIGHT * 4);
+    plugin->gui->image->width = GUI_WIDTH;
+    plugin->gui->image->height = GUI_HEIGHT;
+    plugin->gui->image->bytes_per_line = GUI_WIDTH * 4;
+    plugin->gui->image->data = (char *) plugin->gui->bits;
+
+    // Register the file descriptor we'll receive events from.
+    if (plugin->hostPOSIXFDSupport && plugin->hostPOSIXFDSupport->register_fd) {
+        plugin->hostPOSIXFDSupport->register_fd(plugin->host, ConnectionNumber(plugin->gui->display), CLAP_POSIX_FD_READ);
+    }
+}
+We implement GUIOnPOSIXFD to process as many events as are available, and merge adjacent mouse motion events.
+
+static void GUIOnPOSIXFD(MyPlugin *plugin) {
+    XFlush(plugin->gui->display);
+
+    if (XPending(plugin->gui->display)) {
+        XEvent event;
+        XNextEvent(plugin->gui->display, &event);
+
+        while (XPending(plugin->gui->display)) {
+            XEvent event0;
+            XNextEvent(plugin->gui->display, &event0);
+
+            if (event.type == MotionNotify && event0.type == MotionNotify) {
+                // Merge adjacent mouse motion events.
+            } else {
+                GUIX11ProcessEvent(plugin, &event);
+                XFlush(plugin->gui->display);
+            }
+
+            event = event0;
+        }
+
+        GUIX11ProcessEvent(plugin, &event);
+        XFlush(plugin->gui->display);
+        GUIPaint(plugin, true);
+    }
+
+    XFlush(plugin->gui->display);
+}
+Next, we add GUIPaint and GUIX11ProcessEvent. The former sends our bitmap to the display; the latter send events to the main plugin file.
+
+static void GUIPaint(MyPlugin *plugin, bool internal) {
+    if (internal) PluginPaint(plugin, plugin->gui->bits); // Repaint if necessary.
+    XPutImage(plugin->gui->display, plugin->gui->window, DefaultGC(plugin->gui->display, 0), plugin->gui->image, 0, 0, 0, 0, GUI_WIDTH, GUI_HEIGHT);
+}
+
+static void GUIX11ProcessEvent(MyPlugin *plugin, XEvent *event) {
+    if (event->type == Expose) {
+        if (event->xexpose.window == plugin->gui->window) {
+            GUIPaint(plugin, false /* don't repaint our bitmap buffer */);
+        }
+    } else if (event->type == MotionNotify) {
+        if (event->xmotion.window == plugin->gui->window) {
+            PluginProcessMouseDrag(plugin, event->xmotion.x, event->xmotion.y);
+        }
+    } else if (event->type == ButtonPress) {
+        if (event->xbutton.window == plugin->gui->window && event->xbutton.button == 1) {
+            PluginProcessMousePress(plugin, event->xbutton.x, event->xbutton.y);
+        }
+    } else if (event->type == ButtonRelease) {
+        if (event->xbutton.window == plugin->gui->window && event->xbutton.button == 1) {
+            PluginProcessMouseRelease(plugin);
+        }
+    }
+}
+There are three remaining functions we need to implement: GUIDestroy, GUISetParent and GUISetVisible. These are all fairly simple.
+
+static void GUIDestroy(MyPlugin *plugin) {
+    assert(plugin->gui);
+
+    // Unregister the connection's file descriptor with the host.
+    if (plugin->hostPOSIXFDSupport && plugin->hostPOSIXFDSupport->unregister_fd) {
+        plugin->hostPOSIXFDSupport->unregister_fd(plugin->host, ConnectionNumber(plugin->gui->display));
+    }
+
+    // Destroy the bitmap, window and display.
+    free(plugin->gui->bits);
+    plugin->gui->image->data = NULL;
+    XDestroyImage(plugin->gui->image);
+    XDestroyWindow(plugin->gui->display, plugin->gui->window);
+    XCloseDisplay(plugin->gui->display);
+
+    // Free the GUI structure.
+    free(plugin->gui);
+    plugin->gui = nullptr;
+}
+
+static void GUISetParent(MyPlugin *plugin, const clap_window_t *window) {
+    XReparentWindow(plugin->gui->display, plugin->gui->window, (Window) window->x11, 0, 0);
+    XFlush(plugin->gui->display);
+}
+
+static void GUISetVisible(MyPlugin *plugin, bool visible) {
+    if (visible) XMapRaised(plugin->gui->display, plugin->gui->window);
+    else XUnmapWindow(plugin->gui->display, plugin->gui->window);
+    XFlush(plugin->gui->display);
+}
+And our plugin's GUI is ready! It's just a black screen for now -- we'll first this in the next (and last) part of the tutorial.
+
+Windows
+To your compile command, append user32.dll gdi32.dll.
+
+We now write gui_w32.cpp. We begin by defining the GUI_API constant, including some header files and defining the GUI structure that's part of MyPlugin.
+
+#define GUI_API CLAP_WINDOW_API_WIN32
+
+#include <windowsx.h>
+
+struct GUI {
+    HWND window;
+    uint32_t *bits;
+};
+
+static int globalOpenGUICount = 0;
+We define the functions/macros to set the parent of the window, change the visibility of the window and repaint the window. We ignore "POSIX FD" events -- those are only for Linux.
+
+#define GUISetParent(plugin, parent) SetParent((plugin)->gui->window, (HWND) (parent)->win32)
+#define GUISetVisible(plugin, visible) ShowWindow((plugin)->gui->window, (visible) ? SW_SHOW : SW_HIDE)
+static void GUIOnPOSIXFD(MyPlugin *) {}
+
+static void GUIPaint(MyPlugin *plugin, bool internal) {
+    if (internal) PluginPaint(plugin, plugin->gui->bits);
+    RedrawWindow(plugin->gui->window, 0, 0, RDW_INVALIDATE);
+}
+Creation and deletion of the GUI is a standard affair. We register and unregister the window class as necessary.
+
+static void GUICreate(MyPlugin *plugin) {
+    // Allocate the structure to store GUI specific data.
+    assert(!plugin->gui);
+    plugin->gui = (GUI *) calloc(1, sizeof(GUI));
+
+    if (globalOpenGUICount++ == 0) {
+        // Register the window class.
+        WNDCLASS windowClass = {};
+        windowClass.lpfnWndProc = GUIWindowProcedure;
+        windowClass.cbWndExtra = sizeof(MyPlugin *);
+        windowClass.lpszClassName = pluginDescriptor.id;
+        windowClass.hCursor = LoadCursor(NULL, IDC_ARROW);
+        windowClass.style = CS_DBLCLKS;
+        RegisterClass(&windowClass);
+    }
+
+    // Create the window and allocate the bitmap.
+    plugin->gui->window = CreateWindow(pluginDescriptor.id, pluginDescriptor.name, WS_CHILDWINDOW | WS_CLIPSIBLINGS, 
+            CW_USEDEFAULT, 0, GUI_WIDTH, GUI_HEIGHT, GetDesktopWindow(), NULL, NULL, NULL);
+    plugin->gui->bits = (uint32_t *) calloc(1, GUI_WIDTH * GUI_HEIGHT * 4);
+    SetWindowLongPtr(plugin->gui->window, 0, (LONG_PTR) plugin);
+    GUIPaint(plugin, true);
+}
+
+static void GUIDestroy(MyPlugin *plugin) {
+    // Deallocate the window, the bitmap and the GUI structure.
+    assert(plugin->gui);
+    DestroyWindow(plugin->gui->window);
+    free(plugin->gui->bits);
+    free(plugin->gui);
+    plugin->gui = nullptr;
+
+    if (--globalOpenGUICount == 0) {
+        // Unregister the window class.
+        UnregisterClass(pluginDescriptor.id, NULL);
+    }
+}
+And our plugin's GUI is ready! It's just a black screen for now -- we'll first this in the next (and last) part of the tutorial.
+
+macOS
+We're going to split the code into two files, gui_mac.cpp (C++) and gui_mac.m (Objective C). The former will mostly just be glue code connecting plugin.cpp with gui_mac.m.
+
+We change the compile command to the following:
+
+gcc -c gui_mac.m -g
+g++ -shared -g -Wall -Wextra -Wno-unused-parameter -o ~/Library/Audio/Plug-Ins/CLAP/HelloCLAP.clap plugin.cpp gui_mac.o --std=gnu++17 -framework Cocoa
+Starting with gui_mac.cpp, we declare the functions that will be implemented in gui_mac.m, as well as providing definitions for GUI_API and the GUI structure.
+
+#define GUI_API CLAP_WINDOW_API_COCOA
+
+struct GUI {
+    void *mainView;
+    uint32_t *bits;
+};
+
+extern "C" void *MacInitialise(struct MyPlugin *plugin, uint32_t *bits, uint32_t width, uint32_t height);
+extern "C" void  MacDestroy   (void *mainView);
+extern "C" void  MacSetParent (void *mainView, void *parentView);
+extern "C" void  MacSetVisible(void *mainView, bool show);
+extern "C" void  MacPaint     (void *mainView);
+Next, we implement MacInputEvent, which is responsible for forwarding input events to plugin.cpp.
+
+extern "C" void MacInputEvent(struct MyPlugin *plugin, int32_t cursorX, int32_t cursorY, int8_t button) {
+    if (button == -1) PluginProcessMouseRelease(plugin);
+    if (button ==  0) PluginProcessMouseDrag   (plugin, cursorX, GUI_HEIGHT - 1 - cursorY);
+    if (button ==  1) PluginProcessMousePress  (plugin, cursorX, GUI_HEIGHT - 1 - cursorY);
+    GUIPaint(plugin, true);
+}
+Then we define the functions the GUI platform layer must provide. Most of these defer the main implementation to gui_mac.m.
+
+static void GUIPaint(MyPlugin *plugin, bool internal) {
+    if (internal) PluginPaint(plugin, plugin->gui->bits);
+    MacPaint(plugin->gui->mainView);
+}
+
+static void GUICreate(MyPlugin *plugin) {
+    assert(!plugin->gui);
+    plugin->gui = (GUI *) calloc(1, sizeof(GUI));
+    plugin->gui->bits = (uint32_t *) calloc(1, GUI_WIDTH * GUI_HEIGHT * 4);
+    PluginPaint(plugin, plugin->gui->bits);
+    plugin->gui->mainView = MacInitialise(plugin, plugin->gui->bits, GUI_WIDTH, GUI_HEIGHT);
+}
+
+static void GUIDestroy(MyPlugin *plugin) {
+    assert(plugin->gui);
+    MacDestroy(plugin->gui->mainView);
+    free(plugin->gui->bits);
+    free(plugin->gui);
+    plugin->gui = nullptr;
+}
+
+static void GUISetParent(MyPlugin *plugin, const clap_window_t *parent) { MacSetParent(plugin->gui->mainView, parent->cocoa); }
+static void GUISetVisible(MyPlugin *plugin, bool visible) { MacSetVisible(plugin->gui->mainView, visible); }
+static void GUIOnPOSIXFD(MyPlugin *) {}
+Now onto gui_mac.m. We include the necessary headers, declare the MacInputEvent callback and define the MainView interface.
+
+#import <Foundation/Foundation.h>
+#import <Cocoa/Cocoa.h>
+
+struct MyPlugin;
+void MacInputEvent(struct MyPlugin *plugin, int32_t cursorX, int32_t cursorY, int8_t button);
+
+@interface MainView : NSView
+@property (nonatomic) struct MyPlugin *plugin;
+@property (nonatomic) uint32_t *bits;
+@property (nonatomic) uint32_t width;
+@property (nonatomic) uint32_t height;
+@property (nonatomic) BOOL hasSuperView;
+@end
+The implementation of the MainView consists of copying our bitmap to the screen when requested, and forwarding input events to gui_mac.cpp via MacInputEvent.
+
+@implementation MainView
+- (void)drawRect:(NSRect)dirtyRect {
+    const unsigned char *data = (const unsigned char *) _bits;
+    NSDrawBitmap(self.bounds, _width, _height, 8 /* bits per channel */, 4 /* channels per pixel */, 32 /* bits per pixel */,
+            4 * _width /* bytes per row */, NO /* planar */, NO /* has alpha */, 
+            NSDeviceRGBColorSpace /* color space */, &data /* data */);
+}
+
+- (BOOL)acceptsFirstMouse:(NSEvent *)event {
+    // Don't ignore activation clicks on the plugin window.
+    return YES;
+}
+
+- (void)mouseDown:(NSEvent *)event {
+    NSPoint cursor = [self convertPoint:[event locationInWindow] fromView:nil];
+    MacInputEvent(_plugin, cursor.x, cursor.y, 1);
+}
+
+- (void)mouseUp:(NSEvent *)event {
+    NSPoint cursor = [self convertPoint:[event locationInWindow] fromView:nil];
+    MacInputEvent(_plugin, cursor.x, cursor.y, -1);
+}
+
+- (void)mouseDragged:(NSEvent *)event {
+    NSPoint cursor = [self convertPoint:[event locationInWindow] fromView:nil];
+    MacInputEvent(_plugin, cursor.x, cursor.y, 0);
+}
+@end
+To initialise and destroy the GUI, we allocate and release an instance of MainView respectively.
+
+void *MacInitialise(struct MyPlugin *plugin, uint32_t *bits, uint32_t width, uint32_t height) {
+    NSRect frame;
+    frame.origin.x = 0;
+    frame.origin.y = 0;
+    frame.size.width = width;
+    frame.size.height = height;
+    MainView *mainView = [[MainView alloc] initWithFrame:frame];
+    mainView.plugin = plugin;
+    mainView.bits = bits;
+    mainView.width = width;
+    mainView.height = height;
+    return mainView;
+}
+
+void MacDestroy(void *mainView) {
+    [((MainView *) mainView) release];
+}
+All that remains is to implement the remaining functions by forwarding them to the correct Cocoa calls.
+
+void MacSetParent(void *_mainView, void *_parentView) {
+    MainView *mainView = (MainView *) _mainView;
+    NSView *parentView = (NSView *) _parentView;
+    if (mainView.hasSuperView) [mainView removeFromSuperview];
+    [parentView addSubview:mainView];
+    mainView.hasSuperView = true;
+}
+
+void MacSetVisible(void *_mainView, bool show) {
+    MainView *mainView = (MainView *) _mainView;
+    [mainView setHidden:(show ? NO : YES)];
+}
+
+void MacPaint(void *_mainView) {
+    MainView *mainView = (MainView *) _mainView;
+    [mainView setNeedsDisplayInRect:mainView.bounds];
+}
+And our plugin's GUI is ready! It's just a black screen for now -- we'll first this in the next (and last) part of the tutorial.
+
+-----------------
+
+Right, it's time to actually get a working user interface setup. We'll implement a basic dial and inform the host of changes to the parameter, including the gesture begin and end events. We'll also implement the timer extension so when the host automates the parameter, the dial can be automatically redrawn with the new value.
+
+I assume that you'll be likely replacing the entire GUI code once you've finished the tutorial, so I'm going to keep it as minimal as possible.
+
+We begin by adding a function to draw a rectangle, and implement PluginPaint.
+
+static void PluginPaintRectangle(MyPlugin *plugin, uint32_t *bits, uint32_t l, uint32_t r, uint32_t t, uint32_t b, uint32_t border, uint32_t fill) {
+    for (uint32_t i = t; i < b; i++) {
+        for (uint32_t j = l; j < r; j++) {
+            bits[i * GUI_WIDTH + j] = (i == t || i == b - 1 || j == l || j == r - 1) ? border : fill;
+        }
+    }
+}
+
+static void PluginPaint(MyPlugin *plugin, uint32_t *bits) {
+    // Draw the background.
+    PluginPaintRectangle(plugin, bits, 0, GUI_WIDTH, 0, GUI_HEIGHT, 0xC0C0C0, 0xC0C0C0);
+
+    // Draw the parameter, using the parameter value owned by the main thread.
+    PluginPaintRectangle(plugin, bits, 10, 40, 10, 40, 0x000000, 0xC0C0C0);
+    PluginPaintRectangle(plugin, bits, 10, 40, 10 + 30 * (1.0f - plugin->mainParameters[P_VOLUME]), 40, 0x000000, 0x000000);
+}
+The next step is to allow the user to interact with the dial. First, we'll need to query the host's implementation of the parameters extension so that we can notify it when some parameters have been modified. These will later be picked up on the audio thread and sent to the host via the output events queue. This will either happen in the audio process callback, or in the extensionParams.flush function.
+
+To the MyPlugin structure, add the field const clap_host_params_t *hostParams;. Then in pluginClass.init, set the field using plugin->hostParams = (const clap_host_params_t *) plugin->host->get_extension(plugin->host, CLAP_EXT_PARAMS);.
+
+We're going to maintain an array of gesture events that need to be sent to the host. Gesture events are used to indicate when the user starts and stop modifying a parameter on the plugin's GUI. They aren't necessary to send, but implementing them for continuous controls like dials will ensure the best user experience the host can provide. To the MyPlugin structure we add the following fields:
+
+// Gesture start and end events that need to be sent.
+bool gestureStart[P_COUNT], gestureEnd[P_COUNT];
+
+// Information about the parameter that is currently being modified.
+bool mouseDragging;
+uint32_t mouseDraggingParameter;
+int32_t mouseDragOriginX, mouseDragOriginY;
+float mouseDragOriginValue;
+Let's implement PluginProcessMousePress.
+
+static void PluginProcessMousePress(MyPlugin *plugin, int32_t x, int32_t y) {
+    // If the cursor is inside the dial...
+    if (x >= 10 && x < 40 && y >= 10 && y < 40) {
+        // Start dragging.
+        plugin->mouseDragging = true;
+        plugin->mouseDraggingParameter = P_VOLUME;
+        plugin->mouseDragOriginX = x;
+        plugin->mouseDragOriginY = y;
+        plugin->mouseDragOriginValue = plugin->mainParameters[P_VOLUME];
+
+        // Inform the audio thread to send a gesture start event.
+        MutexAcquire(plugin->syncParameters);
+        plugin->gestureStart[plugin->mouseDraggingParameter] = true;
+        MutexRelease(plugin->syncParameters);
+
+        // Inform the host that either the pluginClass.process or extensionParams.flush
+        // callback should be executed at some point in the near future so that we
+        // can send the host the gesture and parameter value events.
+        if (plugin->hostParams && plugin->hostParams->request_flush) {
+            plugin->hostParams->request_flush(plugin->host);
+        }
+    }
+}
+In PluginProcessMouseRelease we perform the opposite actions.
+
+static void PluginProcessMouseRelease(MyPlugin *plugin) {
+    if (plugin->mouseDragging) {
+        // Inform the audio thread to send a gesture end event.
+        MutexAcquire(plugin->syncParameters);
+        plugin->gestureEnd[plugin->mouseDraggingParameter] = true;
+        MutexRelease(plugin->syncParameters);
+
+        // As before.
+        if (plugin->hostParams && plugin->hostParams->request_flush) {
+            plugin->hostParams->request_flush(plugin->host);
+        }
+
+        // Dragging has stopped.
+        plugin->mouseDragging = false;
+    }
+}
+Finally, we implement PluginProcessMouseDrag. We compute the new value of the parameter, update our array and indicate to the audio thread that it has changed.
+
+static void PluginProcessMouseDrag(MyPlugin *plugin, int32_t x, int32_t y) {
+    if (plugin->mouseDragging) {
+        // Compute the new value of the parameter based on the mouse's position.
+        float newValue = FloatClamp01(plugin->mouseDragOriginValue + (plugin->mouseDragOriginY - y) * 0.01f);
+
+        // Under the syncParameters mutex, update the main thread's parameters array,
+        // and inform the audio thread it should read the value into its array.
+        MutexAcquire(plugin->syncParameters);
+        plugin->mainParameters[plugin->mouseDraggingParameter] = newValue;
+        plugin->mainChanged[plugin->mouseDraggingParameter] = true;
+        MutexRelease(plugin->syncParameters);
+
+        // As before.
+        if (plugin->hostParams && plugin->hostParams->request_flush) {
+            plugin->hostParams->request_flush(plugin->host);
+        }
+    }
+}
+We now need to actually send the gesture events to the host. This takes place in PluginSyncMainToAudio, where we send the CLAP_EVENT_PARAM_VALUE events to the host. We send the CLAP_EVENT_PARAM_GESTURE_BEGIN events first, then the CLAP_EVENT_PARAM_VALUE events, and finally the CLAP_EVENT_PARAM_GESTURE_END events. This ensures that the parameter values events are never sent outside of a gesture.
+
+static void PluginSyncMainToAudio(MyPlugin *plugin, const clap_output_events_t *out) {
+    MutexAcquire(plugin->syncParameters);
+
+    for (uint32_t i = 0; i < P_COUNT; i++) {
+        if (plugin->gestureStart[i]) {
+            plugin->gestureStart[i] = false;
+
+            clap_event_param_gesture_t event = {};
+            event.header.size = sizeof(event);
+            event.header.time = 0;
+            event.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
+            event.header.type = CLAP_EVENT_PARAM_GESTURE_BEGIN;
+            event.header.flags = 0;
+            event.param_id = i;
+            out->try_push(out, &event.header);
+        }
+
+        if (plugin->mainChanged[i]) {
+            // ... unchanged ...
+        }
+
+        if (plugin->gestureEnd[i]) {
+            plugin->gestureEnd[i] = false;
+
+            clap_event_param_gesture_t event = {};
+            event.header.size = sizeof(event);
+            event.header.time = 0;
+            event.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
+            event.header.type = CLAP_EVENT_PARAM_GESTURE_END;
+            event.header.flags = 0;
+            event.param_id = i;
+            out->try_push(out, &event.header);
+        }
+    }
+
+    MutexRelease(plugin->syncParameters);
+}
+Okay, the last thing to do is to implement the timer extension. This will give us a regular callback on the main thread, which will give us an opportunity to periodically synchronize the parameter values from the audio thread to the main thread and repaint the user interface. This will mean that parameters automated by the host will display correctly in the plugin's GUI.
+
+static const clap_plugin_timer_support_t extensionTimerSupport = {
+    .on_timer = [] (const clap_plugin_t *_plugin, clap_id timerID) {
+        MyPlugin *plugin = (MyPlugin *) _plugin->plugin_data;
+
+        // If the GUI is open and at least one parameter value has changed...
+        if (plugin->gui && PluginSyncAudioToMain(plugin)) {
+            // Repaint the GUI.
+            GUIPaint(plugin, true);
+        }
+    },
+};
+And we update pluginClass.get_extension:
+
+.get_extension = [] (const clap_plugin *plugin, const char *id) -> const void * {
+    if (0 == strcmp(id, CLAP_EXT_NOTE_PORTS      )) return &extensionNotePorts;
+    if (0 == strcmp(id, CLAP_EXT_AUDIO_PORTS     )) return &extensionAudioPorts;
+    if (0 == strcmp(id, CLAP_EXT_PARAMS          )) return &extensionParams;
+    if (0 == strcmp(id, CLAP_EXT_GUI             )) return &extensionGUI;
+    if (0 == strcmp(id, CLAP_EXT_POSIX_FD_SUPPORT)) return &extensionPOSIXFDSupport;
+    if (0 == strcmp(id, CLAP_EXT_TIMER_SUPPORT   )) return &extensionTimerSupport;
+    if (0 == strcmp(id, CLAP_EXT_STATE           )) return &extensionState;
+    return nullptr;
+},
+All that's left to do now is to register and unregister the timer when the plugin is initialized and destroyed. We add the following fields to MyPlugin:
+
+const clap_host_timer_support_t *hostTimerSupport;
+clap_id timerID;
+In pluginClass.init, add the following. The timer ID is saved as we will use it to unregister the timer.
+
+plugin->hostTimerSupport = (const clap_host_timer_support_t *) plugin->host->get_extension(plugin->host, CLAP_EXT_TIMER_SUPPORT);
+
+if (plugin->hostTimerSupport && plugin->hostTimerSupport->register_timer) {
+    plugin->hostTimerSupport->register_timer(plugin->host, 200 /* every 200 milliseconds */, &plugin->timerID);
+}
+Finally, in pluginClass.destroy add:
+
+if (plugin->hostTimerSupport && plugin->hostTimerSupport->register_timer) {
+    plugin->hostTimerSupport->unregister_timer(plugin->host, plugin->timerID);
+}
+And that's all there is to it! This is the end of the tutorial. We've built a simple CLAP audio plugin that plays sine waves polyphonically with automatable and non-destructively modulatable parameters, as well as implemented a properly synchronized GUI and state serialization. That's all for now, folks.
