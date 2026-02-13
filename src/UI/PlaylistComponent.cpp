@@ -237,12 +237,10 @@ void PlaylistComponent::selectTrack(int index)
     waitingForTransition = false;
     
     auto& item = playlist[index];
-    if (audioEngine.getMediaPlayer().loadFile(item.filePath))
-    {
-        audioEngine.getMediaPlayer().setVolume(item.volume);
-        audioEngine.getMediaPlayer().setRate(item.playbackSpeed);
-        audioEngine.setPitchSemitones(item.pitchSemitones);
-    }
+    audioEngine.getMediaPlayer().loadFile(item.filePath);
+    audioEngine.getMediaPlayer().setVolume(item.volume);
+    audioEngine.getMediaPlayer().setRate(item.playbackSpeed);
+    audioEngine.setPitchSemitones(item.pitchSemitones);
     
     updateBannerVisuals();
 }

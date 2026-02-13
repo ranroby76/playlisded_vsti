@@ -4,6 +4,10 @@
     VLCMediaPlayer_Desktop.cpp
     Playlisted2 Engine
 
+    Uses S16N format (proven working with VLC 3.0.21 amem).
+    FIX: Volume smoothing to prevent clicks/pops on volume changes.
+    FIX: Use LoadLibraryW for Unicode DLL paths.
+
   ==============================================================================
 */
 
@@ -25,8 +29,8 @@ static bool loadVlcDlls(const juce::File& appDir)
     if (!vlcCore.exists()) return false;
     if (!vlcLib.exists()) return false;
 
-    if (!LoadLibraryA(vlcCore.getFullPathName().toRawUTF8())) return false;
-    if (!LoadLibraryA(vlcLib.getFullPathName().toRawUTF8())) return false;
+    if (!LoadLibraryW(vlcCore.getFullPathName().toWideCharPointer())) return false;
+    if (!LoadLibraryW(vlcLib.getFullPathName().toWideCharPointer())) return false;
     return true;
     #else
     return true;
@@ -69,19 +73,20 @@ void VLCMediaPlayer_Desktop::ensureInitialized()
             "--no-xlib",
             "--quiet",
             
-            // --- SYNC FIXES ---
+            // --- VIDEO ---
             "--avcodec-hw=any",       
-            "--vout=direct3d9",       
+            "--vout=direct3d9",
             "--no-drop-late-frames",  
             "--no-skip-frames", 
             
-            // FIX: Re-enable strict clock sync to keep video tied to audio clock
+            // Let VLC pace video with its internal clock to prevent drift.
+            // The 260ms delay line in getNextAudioBlock handles the fixed 
+            // pipeline offset (amem+FIFO+IPC is faster than video decode+render).
             "--clock-jitter=0",
-            "--clock-synchro=0",
 
-            // Reduce caching for tighter response
-            "--file-caching=150",     
-            "--network-caching=150" 
+            // 500ms caching gives decoder headroom
+            "--file-caching=500",     
+            "--network-caching=500" 
         };
         m_instance = libvlc_new(sizeof(args) / sizeof(args[0]), args);
         if (m_instance)
@@ -106,7 +111,6 @@ bool VLCMediaPlayer_Desktop::prepareToPlay(int samplesPerBlock, double sampleRat
     ensureInitialized();
     maxBlockSize = samplesPerBlock;
     
-    // Resize with new smaller constant
     ringBuffer.setSize(2, InternalBufferSize); 
     fifo.setTotalSize(ringBuffer.getNumSamples());
     fifo.reset();
@@ -116,6 +120,19 @@ bool VLCMediaPlayer_Desktop::prepareToPlay(int samplesPerBlock, double sampleRat
         libvlc_audio_set_format(m_mediaPlayer, "S16N", static_cast<int>(currentSampleRate), 2);
     }
 
+    smoothedVolume = volume;
+    
+    // Delay line for A/V sync — max 500ms at 96kHz = 48000 samples, use 65536 for headroom
+    delayBuffer.setSize(2, 65536);
+    delayBuffer.clear();
+    delayWritePos = 0;
+    delayTotalWritten = 0;
+    
+    // Compensate for audio-ahead-of-video pipeline latency (~100-200ms).
+    // Audio path (amem → FIFO → IPC → DAW) is faster than video path 
+    // (VLC decode → render to HWND), so we delay audio by 150ms.
+    avSyncDelaySamples = (int)(currentSampleRate * 0.26);
+    
     isPrepared = true;
     return true;
 }
@@ -125,6 +142,9 @@ void VLCMediaPlayer_Desktop::releaseResources()
     stop();
     fifo.reset();
     ringBuffer.clear();
+    delayBuffer.clear();
+    delayWritePos = 0;
+    delayTotalWritten = 0;
     isPrepared = false;
 }
 
@@ -156,6 +176,17 @@ void VLCMediaPlayer_Desktop::flushAudioBuffers()
     juce::ScopedLock sl(audioLock);
     fifo.reset();
     ringBuffer.clear();
+    delayBuffer.clear();
+    delayWritePos = 0;
+    delayTotalWritten = 0;
+}
+
+void VLCMediaPlayer_Desktop::setAudioDelay(int64_t delayMs)
+{
+    // Convert ms to samples at current sample rate
+    // Positive = delay audio (let video catch up)
+    int delaySamples = (int)((delayMs * (int64_t)currentSampleRate) / 1000LL);
+    avSyncDelaySamples = juce::jmax(0, delaySamples);
 }
 
 bool VLCMediaPlayer_Desktop::loadFile(const juce::String& path)
@@ -167,9 +198,8 @@ bool VLCMediaPlayer_Desktop::loadFile(const juce::String& path)
     int rate = (currentSampleRate > 0) ? static_cast<int>(currentSampleRate) : 44100;
     libvlc_audio_set_format(m_mediaPlayer, "S16N", rate, 2);
 
-    // FIX: Use file:/// URI with proper URL encoding for Unicode support
     juce::URL fileURL = juce::URL(juce::File(path));
-    juce::String urlString = fileURL.toString(true); // URL-encode the path
+    juce::String urlString = fileURL.toString(true);
     
     libvlc_media_t* media = libvlc_media_new_location(m_instance, urlString.toUTF8());
     if (media == nullptr) return false;
@@ -205,7 +235,6 @@ void VLCMediaPlayer_Desktop::setRate(float newRate)
 { 
     if (m_mediaPlayer) 
     {
-        // Must flush to prevent hearing old-speed audio
         flushAudioBuffers();
         libvlc_media_player_set_rate(m_mediaPlayer, newRate);
     }
@@ -289,13 +318,101 @@ void VLCMediaPlayer_Desktop::getNextAudioBlock(const juce::AudioSourceChannelInf
     if (libvlc_media_player_get_state(m_mediaPlayer) == libvlc_Paused) { info.clearActiveBufferRegion(); return; }
     
     juce::ScopedLock sl(audioLock);
-    int toRead = juce::jmin(info.numSamples, fifo.getNumReady());
+    
+    const int numSamples = info.numSamples;
+    int available = fifo.getNumReady();
+    int toRead = juce::jmin(numSamples, available);
+    
+    // No delay? Straight FIFO-to-output (original path, zero overhead)
+    if (avSyncDelaySamples <= 0)
+    {
+        if (toRead > 0) {
+            int start1, size1, start2, size2;
+            fifo.prepareToRead(toRead, start1, size1, start2, size2);
+            
+            const float targetVol = volume;
+            const float startVol = smoothedVolume;
+            const float volStep = (targetVol - startVol) / (float)toRead;
+            
+            if (size1 > 0) {
+                for (int ch = 0; ch < 2; ++ch) {
+                    const float* src = ringBuffer.getReadPointer(ch, start1);
+                    float* dst = info.buffer->getWritePointer(ch, info.startSample);
+                    float vol = startVol;
+                    for (int i = 0; i < size1; ++i) { dst[i] = src[i] * vol; vol += volStep; }
+                }
+            }
+            if (size2 > 0) {
+                for (int ch = 0; ch < 2; ++ch) {
+                    const float* src = ringBuffer.getReadPointer(ch, start2);
+                    float* dst = info.buffer->getWritePointer(ch, info.startSample + size1);
+                    float vol = startVol + volStep * size1;
+                    for (int i = 0; i < size2; ++i) { dst[i] = src[i] * vol; vol += volStep; }
+                }
+            }
+            smoothedVolume = targetVol;
+            fifo.finishedRead(size1 + size2);
+        }
+        if (toRead < numSamples)
+            info.buffer->clear(info.startSample + toRead, numSamples - toRead);
+        return;
+    }
+    
+    // --- Delay line path ---
+    const int delayLen = delayBuffer.getNumSamples();
+    
+    // Step 1: Drain FIFO into delay line
     if (toRead > 0) {
         int start1, size1, start2, size2;
         fifo.prepareToRead(toRead, start1, size1, start2, size2);
-        if (size1 > 0) for (int ch = 0; ch < 2; ++ch) info.buffer->addFrom(ch, info.startSample, ringBuffer, ch, start1, size1, volume);
-        if (size2 > 0) for (int ch = 0; ch < 2; ++ch) info.buffer->addFrom(ch, info.startSample + size1, ringBuffer, ch, start2, size2, volume);
+        
+        if (size1 > 0) {
+            for (int ch = 0; ch < 2; ++ch) {
+                const float* src = ringBuffer.getReadPointer(ch, start1);
+                float* dly = delayBuffer.getWritePointer(ch);
+                for (int i = 0; i < size1; ++i)
+                    dly[(delayWritePos + i) % delayLen] = src[i];
+            }
+            delayWritePos = (delayWritePos + size1) % delayLen;
+            delayTotalWritten += size1;
+        }
+        if (size2 > 0) {
+            for (int ch = 0; ch < 2; ++ch) {
+                const float* src = ringBuffer.getReadPointer(ch, start2);
+                float* dly = delayBuffer.getWritePointer(ch);
+                for (int i = 0; i < size2; ++i)
+                    dly[(delayWritePos + i) % delayLen] = src[i];
+            }
+            delayWritePos = (delayWritePos + size2) % delayLen;
+            delayTotalWritten += size2;
+        }
         fifo.finishedRead(size1 + size2);
     }
-    if (toRead < info.numSamples) info.buffer->clear(info.startSample + toRead, info.numSamples - toRead);
+    
+    // Step 2: Read from delay line — but only if we've written enough to prime it
+    int effectiveDelay = avSyncDelaySamples;
+    if (delayTotalWritten < effectiveDelay + numSamples)
+    {
+        // Not primed yet — output silence, video catches up during this time
+        info.clearActiveBufferRegion();
+        return;
+    }
+    
+    // Read behind write head by effectiveDelay samples
+    int readPos = (delayWritePos - effectiveDelay - numSamples + delayLen * 2) % delayLen;
+    
+    const float targetVol = volume;
+    const float startVol = smoothedVolume;
+    const float volStep = (targetVol - startVol) / (float)numSamples;
+    
+    for (int ch = 0; ch < juce::jmin(2, info.buffer->getNumChannels()); ++ch) {
+        const float* dly = delayBuffer.getReadPointer(ch);
+        float* dst = info.buffer->getWritePointer(ch, info.startSample);
+        float vol = startVol;
+        for (int i = 0; i < numSamples; ++i) {
+            dst[i] = dly[(readPos + i) % delayLen] * vol;
+            vol += volStep;
+        }
+    }
+    smoothedVolume = targetVol;
 }

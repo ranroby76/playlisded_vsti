@@ -5,8 +5,8 @@ on:
 
 jobs:
   build_mac:
-    name: Build macOS
-    runs-on: macos-latest
+    name: Build macOS VST3 + CLAP
+    runs-on: macos-14
     
     steps:
       - name: Checkout Repository
@@ -15,7 +15,12 @@ jobs:
           lfs: true
 
       - name: Install Dependencies
-        run: brew install ninja cmake
+        run: |
+          brew install ninja
+          brew install cmake || brew upgrade cmake
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.7
 
       - name: Import Signing Certificate
         env:
@@ -32,27 +37,50 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple:,codesign:,productsign: -s -k "$KEYCHAIN_PASSWORD" build.keychain
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
 
-      - name: Clone JUCE Framework
+      - name: Clone JUCE 8.0.12 Framework
         run: |
-          git clone --depth 1 --branch develop https://github.com/juce-framework/JUCE.git libs/JUCE
+          git clone --depth 1 --branch 8.0.12 https://github.com/juce-framework/JUCE.git libs/JUCE
 
       - name: Setup CLAP Extensions
         run: |
-          git clone --depth 1 https://github.com/free-audio/clap-juce-extensions.git libs/CLAP_Extensions
-          git clone --depth 1 https://github.com/free-audio/clap.git libs/CLAP_Extensions/clap-libs/clap
-          git clone --depth 1 https://github.com/free-audio/clap-helpers.git libs/CLAP_Extensions/clap-libs/clap-helpers
+          git clone --recursive https://github.com/free-audio/clap-juce-extensions.git libs/CLAP_Extensions
 
       - name: Configure CMake
         run: |
           cmake -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64" \
-            -DCMAKE_OSX_DEPLOYMENT_TARGET=10.13 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=10.15 \
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache \
             -DJUCE_DIR=libs/JUCE \
-            -DCLAP_EXTENSIONS_DIR=libs/CLAP_Extensions
+            -DCLAP_EXTENSIONS_DIR=libs/CLAP_Extensions \
+            -DPLAYLISTED_ENABLE_VST3=ON \
+            -DPLAYLISTED_ENABLE_AU=OFF \
+            -DPLAYLISTED_ENABLE_CLAP=ON
 
       - name: Build All
         run: cmake --build build --config Release --parallel 4
+
+      - name: Verify Build
+        run: |
+          echo "=== Checking build artefacts ==="
+          find build/Playlisted_artefacts/Release -type d -name "*.vst3" -o -name "*.clap" | head -10
+          
+          if [ -d "build/Playlisted_artefacts/Release/VST3/Playlisted2.vst3" ]; then
+            echo "VST3 found!"
+            find "build/Playlisted_artefacts/Release/VST3/Playlisted2.vst3" -type f | head -10
+          else
+            echo "::error::VST3 NOT found!"
+            find build/Playlisted_artefacts/ -type f | head -20
+            exit 1
+          fi
+          
+          if [ -d "build/Playlisted_artefacts/Release/CLAP/Playlisted2.clap" ]; then
+            echo "CLAP found!"
+          else
+            echo "::warning::CLAP bundle not found"
+          fi
 
       - name: Create Notarization Script
         run: |
@@ -61,63 +89,59 @@ jobs:
           set -e
           
           security unlock-keychain -p "admin" build.keychain
-          
-          echo "Starting Code Signing..."
           IDENTITY=$(security find-identity -v -p codesigning build.keychain | head -1 | grep '"' | sed 's/^.*"\(.*\)".*$/\1/')
           echo "Signing with identity: $IDENTITY"
           
-          # --- VST3 ---
-          if [ -d "build/Playlisted_artefacts/Release/VST3/Playlisted2.vst3" ]; then
-            echo "Processing VST3..."
+          sign_bundle() {
+            local BUNDLE_PATH="$1"
+            local BUNDLE_NAME=$(basename "$BUNDLE_PATH")
+            echo "=== Signing $BUNDLE_NAME ==="
             
-            echo "Signing PlaylistedEngine..."
-            codesign --force --deep --options runtime --sign "$IDENTITY" "build/Playlisted_artefacts/Release/VST3/Playlisted2.vst3/Contents/Resources/PlaylistedEngine"
+            # Sign inner binaries first (inside-out, no --deep)
+            find "$BUNDLE_PATH" -type f \( -name "*.dylib" -o -name "*.so" \) \
+              -exec codesign --force --strict --options runtime --sign "$IDENTITY" --timestamp {} \;
+
+            find "$BUNDLE_PATH" -type d -name "*.framework" \
+              -exec codesign --force --strict --options runtime --sign "$IDENTITY" --timestamp {} \;
+
+            # Sign PlaylistedEngine executable
+            if [ -f "$BUNDLE_PATH/Contents/Resources/PlaylistedEngine" ]; then
+              codesign --force --strict --options runtime --sign "$IDENTITY" --timestamp "$BUNDLE_PATH/Contents/Resources/PlaylistedEngine"
+            fi
+
+            # Sign the outer bundle
+            codesign --force --strict --options runtime --sign "$IDENTITY" --timestamp "$BUNDLE_PATH"
             
-            echo "Signing VST3 Bundle..."
-            codesign --force --deep --options runtime --sign "$IDENTITY" "build/Playlisted_artefacts/Release/VST3/Playlisted2.vst3"
+            # Verify
+            codesign --verify --strict --verbose=2 "$BUNDLE_PATH"
+            echo "$BUNDLE_NAME signed successfully"
+          }
+          
+          notarize_bundle() {
+            local BUNDLE_PATH="$1"
+            local ZIP_NAME="$2"
             
-            echo "Verifying VST3..."
-            codesign --verify --deep --strict --verbose=2 "build/Playlisted_artefacts/Release/VST3/Playlisted2.vst3"
+            /usr/bin/ditto -c -k --keepParent "$BUNDLE_PATH" "$ZIP_NAME"
             
-            echo "Creating VST3 Zip..."
-            /usr/bin/ditto -c -k --keepParent "build/Playlisted_artefacts/Release/VST3/Playlisted2.vst3" "Playlisted2_VST3.zip"
-            
-            echo "Submitting VST3 for notarization..."
-            xcrun notarytool submit "Playlisted2_VST3.zip" \
+            xcrun notarytool submit "$ZIP_NAME" \
               --apple-id "$APPLE_ID" \
               --password "$APPLE_PASSWORD" \
               --team-id "$TEAM_ID" \
               --wait
             
-            echo "Stapling VST3..."
-            xcrun stapler staple "build/Playlisted_artefacts/Release/VST3/Playlisted2.vst3" || echo "Stapling failed (non-critical)"
+            xcrun stapler staple "$BUNDLE_PATH" || echo "Stapling failed (non-critical)"
+          }
+          
+          # --- VST3 ---
+          if [ -d "build/Playlisted_artefacts/Release/VST3/Playlisted2.vst3" ]; then
+            sign_bundle "build/Playlisted_artefacts/Release/VST3/Playlisted2.vst3"
+            notarize_bundle "build/Playlisted_artefacts/Release/VST3/Playlisted2.vst3" "Playlisted2_VST3.zip"
           fi
           
           # --- CLAP ---
           if [ -d "build/Playlisted_artefacts/Release/CLAP/Playlisted2.clap" ]; then
-            echo "Processing CLAP..."
-            
-            echo "Signing PlaylistedEngine..."
-            codesign --force --deep --options runtime --sign "$IDENTITY" "build/Playlisted_artefacts/Release/CLAP/Playlisted2.clap/Contents/Resources/PlaylistedEngine"
-            
-            echo "Signing CLAP Bundle..."
-            codesign --force --deep --options runtime --sign "$IDENTITY" "build/Playlisted_artefacts/Release/CLAP/Playlisted2.clap"
-            
-            echo "Verifying CLAP..."
-            codesign --verify --deep --strict --verbose=2 "build/Playlisted_artefacts/Release/CLAP/Playlisted2.clap"
-            
-            echo "Creating CLAP Zip..."
-            /usr/bin/ditto -c -k --keepParent "build/Playlisted_artefacts/Release/CLAP/Playlisted2.clap" "Playlisted2_CLAP.zip"
-            
-            echo "Submitting CLAP for notarization..."
-            xcrun notarytool submit "Playlisted2_CLAP.zip" \
-              --apple-id "$APPLE_ID" \
-              --password "$APPLE_PASSWORD" \
-              --team-id "$TEAM_ID" \
-              --wait
-            
-            echo "Stapling CLAP..."
-            xcrun stapler staple "build/Playlisted_artefacts/Release/CLAP/Playlisted2.clap" || echo "Stapling failed (non-critical)"
+            sign_bundle "build/Playlisted_artefacts/Release/CLAP/Playlisted2.clap"
+            notarize_bundle "build/Playlisted_artefacts/Release/CLAP/Playlisted2.clap" "Playlisted2_CLAP.zip"
           fi
           EOF
           chmod +x notarize_mac.sh
@@ -147,5 +171,6 @@ jobs:
       - name: Upload Mac Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: Playlisted2-Mac-Universal-Signed
+          name: Playlisted2-Mac-VST3-CLAP-Signed
           path: artifacts_mac/
+          if-no-files-found: error

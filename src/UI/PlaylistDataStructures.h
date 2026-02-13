@@ -7,7 +7,7 @@ struct PlaylistItem
     juce::String title;
     float volume = 1.0f; 
     
-    // NEW: Pitch in Semitones (-12 to +12)
+    // Pitch in Semitones (-12 to +12)
     int pitchSemitones = 0; 
     
     float playbackSpeed = 1.0f;

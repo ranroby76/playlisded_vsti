@@ -1,11 +1,11 @@
-name: Build macOS (AU Only)
+name: Build macOS CLAP
 
 on:
   workflow_dispatch:
 
 jobs:
-  build_au:
-    name: Build AU
+  build_mac_clap:
+    name: Build macOS CLAP
     runs-on: macos-14
     
     steps:
@@ -41,7 +41,11 @@ jobs:
         run: |
           git clone --depth 1 --branch 8.0.12 https://github.com/juce-framework/JUCE.git libs/JUCE
 
-      - name: Configure CMake
+      - name: Setup CLAP Extensions
+        run: |
+          git clone --recursive https://github.com/free-audio/clap-juce-extensions.git libs/CLAP_Extensions
+
+      - name: Configure CMake for CLAP
         run: |
           cmake -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
@@ -50,77 +54,73 @@ jobs:
             -DCMAKE_C_COMPILER_LAUNCHER=sccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=sccache \
             -DJUCE_DIR=libs/JUCE \
+            -DCLAP_EXTENSIONS_DIR=libs/CLAP_Extensions \
             -DPLAYLISTED_ENABLE_VST3=OFF \
-            -DPLAYLISTED_ENABLE_AU=ON \
-            -DPLAYLISTED_ENABLE_CLAP=OFF
+            -DPLAYLISTED_ENABLE_AU=OFF \
+            -DPLAYLISTED_ENABLE_CLAP=ON
 
-      - name: Build AU
+      - name: Build CLAP
         run: cmake --build build --config Release --parallel 4
 
-      - name: Verify AU Build
+      - name: Verify CLAP Build
         run: |
-          echo "=== Checking for AU component ==="
-          if [ -d "build/Playlisted_artefacts/Release/AU/Playlisted2.component" ]; then
-            echo "AU component found!"
-            find "build/Playlisted_artefacts/Release/AU/Playlisted2.component" -type f | head -10
+          echo "Checking for CLAP bundle..."
+          if [ -d "build/Playlisted_artefacts/Release/CLAP/Playlisted2.clap" ]; then
+            echo "CLAP bundle found!"
+            find "build/Playlisted_artefacts/Release/CLAP/Playlisted2.clap" -type f | head -10
           else
-            echo "::error::AU component NOT found!"
+            echo "::error::CLAP bundle NOT found!"
             find build/Playlisted_artefacts/ -type f | head -20
             exit 1
           fi
 
       - name: Create Notarization Script
         run: |
-          cat > notarize_au.sh << 'EOF'
+          cat > notarize_clap.sh << 'EOF'
           #!/bin/bash
           set -e
           
           security unlock-keychain -p "admin" build.keychain
           IDENTITY=$(security find-identity -v -p codesigning build.keychain | head -1 | grep '"' | sed 's/^.*"\(.*\)".*$/\1/')
-          
-          if [ -d "build/Playlisted_artefacts/Release/AU/Playlisted2.component" ]; then
-            echo "Processing AU..."
-            
-            # Sign inner binaries first (inside-out, no --deep)
-            find "build/Playlisted_artefacts/Release/AU/Playlisted2.component" -type f \( -name "*.dylib" -o -name "*.so" \) \
-              -exec codesign --force --strict --options runtime --sign "$IDENTITY" --timestamp {} \;
+          echo "Signing with identity: $IDENTITY"
 
-            find "build/Playlisted_artefacts/Release/AU/Playlisted2.component" -type d -name "*.framework" \
-              -exec codesign --force --strict --options runtime --sign "$IDENTITY" --timestamp {} \;
+          # Sign inner binaries first (inside-out, no --deep)
+          find "build/Playlisted_artefacts/Release/CLAP/Playlisted2.clap" -type f \( -name "*.dylib" -o -name "*.so" \) \
+            -exec codesign --force --strict --options runtime --sign "$IDENTITY" --timestamp {} \;
 
-            # Sign PlaylistedEngine executable
-            if [ -f "build/Playlisted_artefacts/Release/AU/Playlisted2.component/Contents/Resources/PlaylistedEngine" ]; then
-              codesign --force --strict --options runtime --sign "$IDENTITY" --timestamp \
-                "build/Playlisted_artefacts/Release/AU/Playlisted2.component/Contents/Resources/PlaylistedEngine"
-            fi
+          find "build/Playlisted_artefacts/Release/CLAP/Playlisted2.clap" -type d -name "*.framework" \
+            -exec codesign --force --strict --options runtime --sign "$IDENTITY" --timestamp {} \;
 
-            # Sign the outer bundle
+          # Sign PlaylistedEngine executable
+          if [ -f "build/Playlisted_artefacts/Release/CLAP/Playlisted2.clap/Contents/Resources/PlaylistedEngine" ]; then
             codesign --force --strict --options runtime --sign "$IDENTITY" --timestamp \
-              "build/Playlisted_artefacts/Release/AU/Playlisted2.component"
-            
-            # Verify
-            codesign --verify --strict --verbose=2 "build/Playlisted_artefacts/Release/AU/Playlisted2.component"
-            
-            # Zip for notarization
-            /usr/bin/ditto -c -k --keepParent "build/Playlisted_artefacts/Release/AU/Playlisted2.component" "Playlisted2_AU.zip"
-            
-            # Notarize
-            xcrun notarytool submit "Playlisted2_AU.zip" \
-              --apple-id "$APPLE_ID" \
-              --password "$APPLE_PASSWORD" \
-              --team-id "$TEAM_ID" \
-              --wait
-            
-            # Staple
-            xcrun stapler staple "build/Playlisted_artefacts/Release/AU/Playlisted2.component" || echo "Stapling failed (non-critical)"
-          else
-            echo "::error::AU Component not found!"
-            exit 1
+              "build/Playlisted_artefacts/Release/CLAP/Playlisted2.clap/Contents/Resources/PlaylistedEngine"
           fi
-          EOF
-          chmod +x notarize_au.sh
 
-      - name: Sign & Notarize AU with Retry
+          # Sign the outer bundle
+          codesign --force --strict --options runtime --sign "$IDENTITY" --timestamp \
+            "build/Playlisted_artefacts/Release/CLAP/Playlisted2.clap"
+          
+          # Verify
+          codesign --verify --strict --verbose=2 "build/Playlisted_artefacts/Release/CLAP/Playlisted2.clap"
+          echo "CLAP bundle signed successfully"
+          
+          # Zip for notarization
+          /usr/bin/ditto -c -k --keepParent "build/Playlisted_artefacts/Release/CLAP/Playlisted2.clap" "Playlisted2_CLAP.zip"
+          
+          # Notarize
+          xcrun notarytool submit "Playlisted2_CLAP.zip" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_PASSWORD" \
+            --team-id "$TEAM_ID" \
+            --wait
+          
+          # Staple
+          xcrun stapler staple "build/Playlisted_artefacts/Release/CLAP/Playlisted2.clap" || echo "Stapling failed (non-critical)"
+          EOF
+          chmod +x notarize_clap.sh
+
+      - name: Notarize CLAP with Retry
         uses: nick-fields/retry@v3
         env:
           APPLE_ID: ${{ secrets.MACOS_NOTARIZATION_USERNAME }}
@@ -130,11 +130,11 @@ jobs:
           timeout_minutes: 30
           max_attempts: 3
           retry_wait_seconds: 60
-          command: ./notarize_au.sh
+          command: ./notarize_clap.sh
 
-      - name: Upload AU Artifact
+      - name: Upload macOS CLAP
         uses: actions/upload-artifact@v4
         with:
-          name: Playlisted2-Mac-AU-Signed
-          path: build/Playlisted_artefacts/Release/AU/Playlisted2.component
+          name: Playlisted2-Mac-CLAP-Signed
+          path: build/Playlisted_artefacts/Release/CLAP/Playlisted2.clap
           if-no-files-found: error

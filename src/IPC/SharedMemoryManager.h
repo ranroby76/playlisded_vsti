@@ -6,19 +6,21 @@
 
     Handles Inter-Process Communication (IPC) via Memory Mapped Files.
     FIXED: Added flushAudioBuffer to prevent "ghost audio" bursts on startup.
+    FIX: Added DAW sample rate field to SharedMemoryLayout for rate sync.
+    FIX: popAudio now does partial reads instead of all-or-nothing silence.
   ==============================================================================
 */
 
 #pragma once
 #include <juce_core/juce_core.h>
 #include <juce_audio_basics/juce_audio_basics.h>
-#include <algorithm> // Added for std::fill
+#include <algorithm>
 
 namespace IPCConfig
 {
-    // BUMPED VERSION TO v3 to support new Window State flag
-    static const char* SharedMemoryName = "Playlisted2_SharedMem_v3.dat";
-    // Audio Settings
+    // BUMPED VERSION TO v4 to support sample rate sync
+    static const char* SharedMemoryName = "Playlisted2_SharedMem_v4.dat";
+    // Audio Settings (defaults - actual rate comes from DAW)
     static const int SampleRate = 44100;
     static const int BlockSize  = 512;
     static const int NumChannels = 2;
@@ -42,12 +44,15 @@ struct SharedMemoryLayout
     std::atomic<bool> isEngineRunning { false };
     std::atomic<bool> isPlaying { false };
     std::atomic<bool> hasFinished { false };
-    // NEW: Window Visibility Flag
+    // Window Visibility Flag
     std::atomic<bool> isWindowOpen { true };
     
     std::atomic<float> currentPosition { 0.0f };
     std::atomic<int64_t> currentLengthMs { 0 };
     std::atomic<double> currentCallbackTime { 0.0 };
+
+    // FIX: DAW sample rate - plugin writes, engine reads
+    std::atomic<int> dawSampleRate { 44100 };
 
     // --- AUDIO ---
     std::atomic<int> audioWritePos { 0 };
@@ -105,7 +110,7 @@ public:
             // CLIENT: Wait for file to exist
             if (!sharedFile.existsAsFile()) return false;
             // Wait for size to settle
-            if (sharedFile.getSize() < sizeof(SharedMemoryLayout)) return false;
+            if (sharedFile.getSize() < (int64_t)sizeof(SharedMemoryLayout)) return false;
         }
 
         try
@@ -133,6 +138,24 @@ public:
     bool isConnected() const 
     { 
         return layout != nullptr && layout->isEngineRunning.load();
+    }
+
+    // ==============================================================================
+    // SAMPLE RATE SYNC
+    // ==============================================================================
+    
+    // Plugin calls this when DAW provides sample rate
+    void setDawSampleRate(int rate)
+    {
+        if (layout) layout->dawSampleRate.store(rate);
+    }
+    
+    // Engine reads this to match DAW sample rate
+    int getDawSampleRate() const
+    {
+        if (!layout) return 44100;
+        int rate = layout->dawSampleRate.load();
+        return (rate > 1000) ? rate : 44100;
     }
 
     // ==============================================================================
@@ -183,17 +206,14 @@ public:
         int availableFloats = (writePos - readPos + totalSize) % totalSize;
         int availableFrames = availableFloats / IPCConfig::NumChannels;
 
-        // Underrun protection
-        if (availableFrames < numSamples)
-        {
-            buffer.clear();
-            return; 
-        }
+        // FIX: Partial read instead of all-or-nothing
+        // Read whatever is available, fill remainder with silence
+        int toRead = juce::jmin(availableFrames, numSamples);
 
         auto* l = buffer.getWritePointer(0);
         auto* r = buffer.getNumChannels() > 1 ? buffer.getWritePointer(1) : nullptr;
 
-        for (int i = 0; i < numSamples; ++i)
+        for (int i = 0; i < toRead; ++i)
         {
             float left = layout->audioBuffer[readPos];
             readPos = (readPos + 1) % totalSize;
@@ -203,6 +223,16 @@ public:
 
             l[i] = left;
             if (r) r[i] = right;
+        }
+
+        // Fill remaining with silence (if underrun)
+        if (toRead < numSamples)
+        {
+            for (int i = toRead; i < numSamples; ++i)
+            {
+                l[i] = 0.0f;
+                if (r) r[i] = 0.0f;
+            }
         }
 
         layout->audioReadPos.store(readPos);

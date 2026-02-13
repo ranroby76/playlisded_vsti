@@ -4,6 +4,9 @@
     VLCMediaPlayer_Desktop.h
     Playlisted2
 
+    FIX: Volume smoothing to prevent clicks on volume changes.
+    FIX: LoadLibraryW for Unicode DLL paths.
+
   ==============================================================================
 */
 
@@ -51,6 +54,9 @@ public:
     int64_t getLengthMs() const;
     
     void flushAudioBuffers();
+    
+    // A/V Sync: delay in milliseconds (positive = delay audio, let video catch up)
+    void setAudioDelay(int64_t delayMs);
 
 private:
     void ensureInitialized();
@@ -69,15 +75,23 @@ private:
     libvlc_media_player_t* m_mediaPlayer = nullptr;
     juce::CriticalSection audioLock;
     
-    // FIX: Reduced buffer size from 131072 to 16384 to fix A/V Sync drift
-    // 16384 samples @ 44.1k is approx 370ms, which is much tighter than the previous 3s buffer
     static const int InternalBufferSize = 16384;
     juce::AudioBuffer<float> ringBuffer {2, InternalBufferSize}; 
     juce::AbstractFifo fifo {InternalBufferSize};
 
     double currentSampleRate = 44100.0;
     int maxBlockSize = 512;
+    
+    // Volume with smoothing
     float volume = 1.0f;
+    float smoothedVolume = 1.0f;
+    int avSyncDelaySamples = 0;  // Audio delay in samples for A/V sync
+    
+    // Delay line buffer for A/V sync
+    juce::AudioBuffer<float> delayBuffer;
+    int delayWritePos = 0;
+    int64_t delayTotalWritten = 0;
+    
     bool isPrepared = false;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(VLCMediaPlayer_Desktop)

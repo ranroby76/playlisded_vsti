@@ -9,6 +9,9 @@
     - macOS: Uses NativeMediaPlayer_Apple (AVFoundation Image Extraction)
     
     ADDED: Heartbeat watchdog - auto-quit if plugin stops responding
+    FIX: Engine reads DAW sample rate from IPC and reconfigures VLC accordingly.
+    FIX: Faster audio pump loop (1ms instead of 2ms) to reduce underruns.
+    FIX: OpenGL-accelerated video rendering on macOS for smooth playback.
 
   ==============================================================================
 */
@@ -17,6 +20,7 @@
 #include <juce_events/juce_events.h>
 #include <juce_graphics/juce_graphics.h>
 #include <juce_gui_basics/juce_gui_basics.h>
+#include <juce_opengl/juce_opengl.h>
 #include "IPC/SharedMemoryManager.h"
 #include <fstream>
 
@@ -45,16 +49,35 @@ void logToDesktop(const juce::String& text)
 // ==============================================================================
 // VIDEO COMPONENT (Handles Drawing)
 // ==============================================================================
-class VideoComponent : public juce::Component, private juce::Timer
+#if JUCE_MAC
+
+// macOS: OpenGL-accelerated video rendering
+class VideoComponent : public juce::Component, 
+                       private juce::Timer,
+                       private juce::OpenGLRenderer
 {
 public:
-    VideoComponent() { setOpaque(true); }
+    VideoComponent() 
+    { 
+        setOpaque(true);
+        
+        // Attach OpenGL context to this component
+        glContext.setRenderer(this);
+        glContext.setContinuousRepainting(false); // We control repainting via timer
+        glContext.setComponentPaintingEnabled(false); // We handle all rendering in GL
+        glContext.attachTo(*this);
+        
+        logToDesktop("VideoComponent: OpenGL context attached");
+    }
+    
+    ~VideoComponent() override
+    {
+        glContext.detach();
+    }
 
-    #if JUCE_MAC
     void setPlayer(PlatformPlayer* p) 
     { 
         player = p; 
-        // Mac needs to poll for frames
         startTimerHz(30); 
     }
 
@@ -62,53 +85,206 @@ public:
     {
         if (player && player->isPlaying()) 
         {
-            // Fetch frame from AVFoundation
             juce::Image newFrame = player->getCurrentVideoFrame();
             if (newFrame.isValid())
             {
-                currentFrame = newFrame;
-                repaint();
+                // Thread-safe swap of the pending frame
+                const juce::ScopedLock sl(frameLock);
+                pendingFrame = newFrame;
+                hasNewFrame = true;
             }
+            // Trigger an OpenGL repaint
+            glContext.triggerRepaint();
         }
-        else if (player && !player->isPlaying() && currentFrame.isValid())
+        else if (player && !player->isPlaying())
         {
-            // Keep drawing the last frame if paused, or clear if stopped?
-            // For now, repaint to ensure updates
-            repaint();
+            // Still trigger repaint to show last frame / idle state
+            glContext.triggerRepaint();
         }
     }
-
-    void paint(juce::Graphics& g) override 
-    { 
-        g.fillAll(juce::Colours::black);
-        
-        if (currentFrame.isValid())
+    
+    // --- OpenGLRenderer callbacks ---
+    
+    void newOpenGLContextCreated() override
+    {
+        logToDesktop("VideoComponent: OpenGL context created");
+        textureID = 0;
+        textureWidth = 0;
+        textureHeight = 0;
+    }
+    
+    void openGLContextClosing() override
+    {
+        logToDesktop("VideoComponent: OpenGL context closing");
+        if (textureID != 0)
         {
-            // Draw video frame scaling to fit
-            g.drawImage(currentFrame, getLocalBounds().toFloat(), juce::RectanglePlacement::centred);
+            juce::gl::glDeleteTextures(1, &textureID);
+            textureID = 0;
+        }
+    }
+    
+    void renderOpenGL() override
+    {
+        using namespace juce::gl;
+        
+        // Check for new frame and upload to texture
+        juce::Image frameToUpload;
+        {
+            const juce::ScopedLock sl(frameLock);
+            if (hasNewFrame)
+            {
+                frameToUpload = pendingFrame;
+                hasNewFrame = false;
+            }
+        }
+        
+        if (frameToUpload.isValid())
+        {
+            uploadTexture(frameToUpload);
+        }
+        
+        // Get actual pixel dimensions (retina-aware)
+        const float scale = (float)glContext.getRenderingScale();
+        const int viewW = (int)(getWidth() * scale);
+        const int viewH = (int)(getHeight() * scale);
+        
+        glViewport(0, 0, viewW, viewH);
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        
+        if (textureID != 0 && textureWidth > 0 && textureHeight > 0)
+        {
+            // Calculate aspect-ratio-correct quad
+            float srcAspect = (float)textureWidth / (float)textureHeight;
+            float dstAspect = (float)viewW / (float)viewH;
+            
+            float quadX, quadY, quadW, quadH;
+            if (srcAspect > dstAspect)
+            {
+                // Video is wider — letterbox top/bottom
+                quadW = (float)viewW;
+                quadH = quadW / srcAspect;
+                quadX = 0.0f;
+                quadY = ((float)viewH - quadH) * 0.5f;
+            }
+            else
+            {
+                // Video is taller — pillarbox left/right
+                quadH = (float)viewH;
+                quadW = quadH * srcAspect;
+                quadX = ((float)viewW - quadW) * 0.5f;
+                quadY = 0.0f;
+            }
+            
+            // Convert to GL normalized coordinates (-1 to 1)
+            float left   = (quadX / (float)viewW) * 2.0f - 1.0f;
+            float right  = ((quadX + quadW) / (float)viewW) * 2.0f - 1.0f;
+            float bottom = (quadY / (float)viewH) * 2.0f - 1.0f;
+            float top    = ((quadY + quadH) / (float)viewH) * 2.0f - 1.0f;
+            
+            // Draw textured quad using fixed-function pipeline
+            glEnable(GL_TEXTURE_2D);
+            glBindTexture(GL_TEXTURE_2D, textureID);
+            
+            glBegin(GL_QUADS);
+                glTexCoord2f(0.0f, 0.0f); glVertex2f(left,  top);
+                glTexCoord2f(1.0f, 0.0f); glVertex2f(right, top);
+                glTexCoord2f(1.0f, 1.0f); glVertex2f(right, bottom);
+                glTexCoord2f(0.0f, 1.0f); glVertex2f(left,  bottom);
+            glEnd();
+            
+            glBindTexture(GL_TEXTURE_2D, 0);
+            glDisable(GL_TEXTURE_2D);
         }
         else
         {
-            // Show status text when no video
-            g.setColour(juce::Colours::grey);
-            g.setFont(16.0f);
-            g.drawText("Playlisted2 Video Output", getLocalBounds(), juce::Justification::centred);
+            // No texture — black screen is already cleared above
+            // Could draw text here but keeping it simple
         }
     }
     
-    private:
-        PlatformPlayer* player = nullptr;
-        juce::Image currentFrame;
+    // Fallback paint — only called if OpenGL fails to attach
+    void paint(juce::Graphics& g) override 
+    { 
+        g.fillAll(juce::Colours::black);
+        g.setColour(juce::Colours::grey);
+        g.setFont(16.0f);
+        g.drawText("Playlisted2 Video Output", getLocalBounds(), juce::Justification::centred);
+    }
 
-    #else
-    // Windows (VLC handles painting directly to the window handle)
-    void paint(juce::Graphics& g) override { g.fillAll(juce::Colours::black); }
+private:
+    void uploadTexture(const juce::Image& image)
+    {
+        using namespace juce::gl;
+        
+        // Convert to ARGB format for GL upload
+        juce::Image argbImage = image.convertedToFormat(juce::Image::ARGB);
+        juce::Image::BitmapData bitmapData(argbImage, juce::Image::BitmapData::readOnly);
+        
+        int w = argbImage.getWidth();
+        int h = argbImage.getHeight();
+        
+        // Create or resize texture if dimensions changed
+        if (textureID == 0 || w != textureWidth || h != textureHeight)
+        {
+            if (textureID != 0)
+                glDeleteTextures(1, &textureID);
+            
+            glGenTextures(1, &textureID);
+            glBindTexture(GL_TEXTURE_2D, textureID);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_BGRA_EXT, GL_UNSIGNED_BYTE, nullptr);
+            
+            textureWidth = w;
+            textureHeight = h;
+            
+            logToDesktop("VideoComponent: Created GL texture " + juce::String(w) + "x" + juce::String(h));
+        }
+        else
+        {
+            glBindTexture(GL_TEXTURE_2D, textureID);
+        }
+        
+        // Upload pixel data row by row (handles stride/padding differences)
+        for (int y = 0; y < h; ++y)
+        {
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, y, w, 1, 
+                           GL_BGRA_EXT, GL_UNSIGNED_BYTE, 
+                           bitmapData.getLinePointer(y));
+        }
+        
+        glBindTexture(GL_TEXTURE_2D, 0);
+    }
     
-    // FIX: Must implement timerCallback on Windows too, even if empty, 
-    // because we inherit from juce::Timer.
-    void timerCallback() override {}
-    #endif
+    juce::OpenGLContext glContext;
+    juce::CriticalSection frameLock;
+    juce::Image pendingFrame;
+    bool hasNewFrame = false;
+    
+    GLuint textureID = 0;
+    int textureWidth = 0;
+    int textureHeight = 0;
+    
+    PlatformPlayer* player = nullptr;
 };
+
+#else
+
+// Windows: VLC renders directly to HWND — no OpenGL needed
+class VideoComponent : public juce::Component, private juce::Timer
+{
+public:
+    VideoComponent() { setOpaque(true); }
+    
+    void paint(juce::Graphics& g) override { g.fillAll(juce::Colours::black); }
+    void timerCallback() override {}
+};
+
+#endif
 
 // ==============================================================================
 // VIDEO WINDOW
@@ -126,7 +302,6 @@ public:
         setAlwaysOnTop(true);
         centreWithSize(640, 360);
         
-        // FIX: Ensure window is visible on creation
         setVisible(true);
         toFront(true);
         
@@ -140,14 +315,13 @@ public:
         return nullptr;
     }
     
-    // Helper to pass player to component (Mac only needs this)
     void bindPlayer(PlatformPlayer* player)
     {
         #if JUCE_MAC
         if (videoComp) 
         {
             videoComp->setPlayer(player);
-            logToDesktop("VideoWindow: Player bound to VideoComponent");
+            logToDesktop("VideoWindow: Player bound to VideoComponent (OpenGL)");
         }
         #else
         juce::ignoreUnused(player);
@@ -164,6 +338,7 @@ private:
 
 // ==============================================================================
 // SINGLE DECK CLASS (WRAPPER)
+// FIX: Added reconfigureSampleRate() to sync with DAW sample rate from IPC.
 // ==============================================================================
 class SingleDeckPlayer
 {
@@ -178,22 +353,31 @@ public:
         window = win;
         
         #if JUCE_WINDOWS
-            // Windows: Pass HWND to VLC
             if (window && window->getNativeHandle()) 
                 player.setWindowHandle(window->getNativeHandle());
         #elif JUCE_MAC
-            // Mac: Pass Player instance to Window for polling
             if (window)
                 window->bindPlayer(&player);
         #endif
     }
+
+    // FIX: Called by the pump loop when DAW sample rate changes
+    void reconfigureSampleRate(int newRate)
+    {
+        if (newRate == currentSampleRate || newRate < 8000) return;
+        
+        currentSampleRate = newRate;
+        logToDesktop("SingleDeckPlayer: Reconfiguring to DAW sample rate: " + juce::String(newRate));
+        player.prepareToPlay(512, (double)newRate);
+    }
+    
+    int getCurrentSampleRate() const { return currentSampleRate; }
 
     void load(const juce::String& path, float vol, float rate)
     {
         player.stop();
         
         #if JUCE_WINDOWS
-        // Ensure handle is set before loading to prevent popup
         if (window && window->getNativeHandle()) 
             player.setWindowHandle(window->getNativeHandle());
         #endif
@@ -236,12 +420,6 @@ public:
         #if JUCE_WINDOWS
             return player.getNumAudioSamplesAvailable(); 
         #else
-            // AVFoundation implementation might not use the same FIFO structure explicitly exposed
-            // But NativeMediaPlayer_Apple usually handles this internally via ResamplingAudioSource.
-            // If the native class doesn't expose this method, we can mock it or add it.
-            // Checking NativeMediaPlayer_Apple.h... it DOES NOT expose getNumAudioSamplesAvailable.
-            // However, it pulls synchronously via getNextAudioBlock.
-            // So we can always return block size to keep the pump running.
             return 4096; 
         #endif
     }
@@ -249,6 +427,7 @@ public:
 private:
     PlatformPlayer player;
     VideoWindow* window = nullptr;
+    int currentSampleRate = 44100;
 };
 
 // ==============================================================================
@@ -287,12 +466,18 @@ public:
         
         logToDesktop("IPC initialized successfully");
 
+        // FIX: Read DAW sample rate early and apply it
+        int dawRate = ipc.getDawSampleRate();
+        logToDesktop("DAW sample rate from IPC: " + juce::String(dawRate));
+
         // Create video window on message thread
         videoWin = std::make_unique<VideoWindow>();
         videoWin->toFront(true);
         
         logToDesktop("VideoWindow created, binding player...");
         
+        // FIX: Configure player with DAW sample rate before binding
+        player.reconfigureSampleRate(dawRate);
         player.setVideoWindow(videoWin.get());
 
         logToDesktop("Starting audio pump thread...");
@@ -318,15 +503,17 @@ public:
         int counter = 0;
         
         // Heartbeat watchdog - quit if no heartbeat for 10 seconds
-        const int heartbeatTimeoutFrames = 10 * 500; // 10 seconds at 2ms loop
+        const int heartbeatTimeoutFrames = 10 * 1000; // 10 seconds at 1ms loop
         int framesSinceHeartbeat = 0;
+        
+        // FIX: Track sample rate changes from DAW
+        int lastKnownRate = player.getCurrentSampleRate();
 
         while (!threadShouldExit())
         {
             juce::String cmdJson = ipc.getNextCommand();
             if (cmdJson.isNotEmpty()) 
             {
-                // Check for heartbeat
                 if (cmdJson.contains("\"heartbeat\""))
                 {
                     framesSinceHeartbeat = 0;
@@ -337,10 +524,8 @@ public:
                 }
             }
             
-            // Increment heartbeat counter
             framesSinceHeartbeat++;
             
-            // Check for zombie condition - plugin stopped sending heartbeats
             if (framesSinceHeartbeat > heartbeatTimeoutFrames)
             {
                 logToDesktop("WATCHDOG: No heartbeat for 10 seconds - plugin likely terminated. Quitting engine.");
@@ -350,9 +535,19 @@ public:
                 return;
             }
 
+            // FIX: Check for sample rate changes from DAW (poll every ~500ms)
+            if (counter % 500 == 0)
+            {
+                int dawRate = ipc.getDawSampleRate();
+                if (dawRate != lastKnownRate && dawRate > 1000)
+                {
+                    logToDesktop("DAW sample rate changed: " + juce::String(lastKnownRate) + " -> " + juce::String(dawRate));
+                    player.reconfigureSampleRate(dawRate);
+                    lastKnownRate = dawRate;
+                }
+            }
+
             // Audio Pumping
-            // On Windows (VLC), we wait for FIFO.
-            // On Mac (Native), getNextAudioBlock blocks/pulls from reader.
             if (player.getNumAudioSamplesAvailable() >= blockSize)
             {
                 tempBuffer.clear();
@@ -360,9 +555,8 @@ public:
                 ipc.pushAudio(tempBuffer.getArrayOfReadPointers(), 2, blockSize);
             }
 
-            if (counter++ % 4 == 0)
+            if (counter++ % 8 == 0)
             {
-                // Push status to shared memory, including Window Visibility
                 bool isWinOpen = (videoWin && videoWin->isVisible());
                 ipc.setEngineStatus(
                     player.isPlaying(), 
@@ -372,7 +566,9 @@ public:
                     player.getLengthMs()
                 );
             }
-            wait(2);
+            
+            // FIX: 1ms pump loop for tighter audio delivery
+            wait(1);
         }
     }
 

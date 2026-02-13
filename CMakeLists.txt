@@ -36,8 +36,13 @@ else()
     message(FATAL_ERROR "JUCE directory not found at ${JUCE_DIR}!")
 endif()
 
-# --- CLAP EXTENSIONS SETUP (Desktop only) ---
-if(NOT IOS)
+# --- FORMAT OPTIONS (for CI: build only the formats you need) ---
+option(PLAYLISTED_ENABLE_VST3 "Build VST3 format" ON)
+option(PLAYLISTED_ENABLE_AU   "Build AU format"   ON)
+option(PLAYLISTED_ENABLE_CLAP "Build CLAP format" ON)
+
+# --- CLAP EXTENSIONS SETUP (Desktop only, when CLAP enabled) ---
+if(NOT IOS AND PLAYLISTED_ENABLE_CLAP)
     if(NOT DEFINED CLAP_EXTENSIONS_DIR)
         set(CLAP_EXTENSIONS_DIR "${PROJECT_ROOT}/libs/CLAP_Extensions") 
     endif()
@@ -74,10 +79,10 @@ if(NOT IOS)
         add_custom_command(TARGET PlaylistedEngine POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_directory "${VLC_DIR}/plugins" "$<TARGET_FILE_DIR:PlaylistedEngine>/plugins")
     elseif(APPLE)
         add_definitions(-DJUCE_MAC=1)
-        target_link_libraries(PlaylistedEngine PRIVATE "-framework Cocoa" "-framework CoreAudio" "-framework CoreMIDI" "-framework AudioToolbox" "-framework IOKit" "-framework Accelerate" "-framework QuartzCore" "-framework WebKit" "-framework Foundation" "-framework AVFoundation" "-framework CoreMedia" "-framework CoreVideo")
+        target_link_libraries(PlaylistedEngine PRIVATE "-framework Cocoa" "-framework CoreAudio" "-framework CoreMIDI" "-framework AudioToolbox" "-framework IOKit" "-framework Accelerate" "-framework QuartzCore" "-framework WebKit" "-framework Foundation" "-framework AVFoundation" "-framework CoreMedia" "-framework CoreVideo" "-framework OpenGL")
     endif()
 
-    target_link_libraries(PlaylistedEngine PRIVATE juce::juce_core juce::juce_events juce::juce_graphics juce::juce_gui_basics juce::juce_audio_basics juce::juce_audio_devices juce::juce_audio_formats)
+    target_link_libraries(PlaylistedEngine PRIVATE juce::juce_core juce::juce_events juce::juce_graphics juce::juce_gui_basics juce::juce_opengl juce::juce_audio_basics juce::juce_audio_devices juce::juce_audio_formats)
 endif()
 
 # ==============================================================================
@@ -97,7 +102,16 @@ endif()
 if(IOS)
     set(PLUGIN_FORMATS AUv3 Standalone)
 else()
-    set(PLUGIN_FORMATS VST3 AU CLAP)
+    set(PLUGIN_FORMATS "")
+    if(PLAYLISTED_ENABLE_VST3)
+        list(APPEND PLUGIN_FORMATS VST3)
+    endif()
+    if(PLAYLISTED_ENABLE_AU)
+        list(APPEND PLUGIN_FORMATS AU)
+    endif()
+    if(PLAYLISTED_ENABLE_CLAP)
+        list(APPEND PLUGIN_FORMATS CLAP)
+    endif()
 endif()
 
 # Binary Data (Linked globally to avoid missing header issues)
@@ -105,12 +119,15 @@ juce_add_binary_data(OnStageAssets SOURCES "${ASSETS_DIR}/logo.png" "${ASSETS_DI
 
 juce_add_plugin(Playlisted 
     COMPANY_NAME "Fanan" 
+    PLUGIN_MANUFACTURER_CODE Fana
+    PLUGIN_CODE Pl2d
     IS_SYNTH TRUE 
     NEEDS_MIDI_INPUT TRUE 
     NEEDS_MIDI_OUTPUT FALSE 
     IS_MIDI_EFFECT FALSE 
     EDITOR_WANTS_KEYBOARD_FOCUS TRUE 
-    COPY_PLUGIN_AFTER_BUILD TRUE 
+    COPY_PLUGIN_AFTER_BUILD FALSE 
+    HARDENED_RUNTIME_ENABLED TRUE
     FORMATS ${PLUGIN_FORMATS}
     PRODUCT_NAME "Playlisted2" 
     VERSION "2.0.0"
@@ -175,11 +192,13 @@ if(IOS)
     add_custom_command(TARGET Playlisted_AUv3 POST_BUILD 
         COMMAND ${CMAKE_COMMAND} -E copy_directory "${ASSETS_DIR}" "$<TARGET_FILE_DIR:Playlisted_AUv3>/../Resources/assets")
 else()
-    # Enable CLAP for desktop
-    target_link_libraries(Playlisted PRIVATE clap_juce_extensions)
-    clap_juce_extensions_plugin(TARGET Playlisted
-                                 CLAP_ID "com.fanan.playlisted2"
-                                 CLAP_FEATURES instrument)
+    # Enable CLAP for desktop (only when CLAP format is enabled)
+    if(PLAYLISTED_ENABLE_CLAP)
+        target_link_libraries(Playlisted PRIVATE clap_juce_extensions)
+        clap_juce_extensions_plugin(TARGET Playlisted
+                                     CLAP_ID "com.fanan.playlisted2"
+                                     CLAP_FEATURES instrument)
+    endif()
     
     add_dependencies(Playlisted PlaylistedEngine)
 endif()

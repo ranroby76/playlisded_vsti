@@ -22,7 +22,6 @@ TrackBannerComponent::TrackBannerComponent(int index, PlaylistItem& item,
     indexLabel.setInterceptsMouseClicks(false, false); 
     
     addAndMakeVisible(playSelectionButton);
-    // FIX: Updated Tooltip to reflect "Load Only" behavior
     playSelectionButton.setTooltip("Select / Load this track");
     playSelectionButton.onClick = onSelectCallback; 
 
@@ -39,7 +38,6 @@ TrackBannerComponent::TrackBannerComponent(int index, PlaylistItem& item,
     crossfadeButton.setToggleState(false, juce::dontSendNotification);
     
     addAndMakeVisible(expandButton);
-    // FIX: Using arrow symbols instead of +/-
     expandButton.setButtonText(itemData.isExpanded ? "^" : "v");
     expandButton.setMidiInfo("Show/Hide Controls (Volume, Pitch, Speed, Wait)");
     expandButton.setColour(juce::TextButton::buttonColourId, juce::Colours::transparentBlack);
@@ -126,19 +124,13 @@ void TrackBannerComponent::mouseDown(const juce::MouseEvent& e)
     handleMouseDown(e);
 }
 
-void TrackBannerComponent::mouseUp(const juce::MouseEvent& e)
-{
-    handleMouseUp(e);
-}
-
-void TrackBannerComponent::mouseDrag(const juce::MouseEvent& e)
-{
-    handleMouseDrag(e);
-}
+void TrackBannerComponent::mouseUp(const juce::MouseEvent& e) { handleMouseUp(e); if (e.mods.isRightButtonDown() || isLongPressTriggered) return; }
+void TrackBannerComponent::mouseDrag(const juce::MouseEvent& e) { handleMouseDrag(e); }
 
 void TrackBannerComponent::paint(juce::Graphics& g)
 {
-    auto bounds = getLocalBounds().toFloat();
+    auto bounds = getLocalBounds().toFloat().reduced(2);
+
     if (isCurrentTrack) g.setColour(juce::Colour(0xFF152215)); 
     else g.setColour(juce::Colour(0xFF1A1A1A));
 

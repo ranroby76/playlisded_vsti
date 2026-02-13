@@ -4,59 +4,56 @@
     AudioEngine.h
     Playlisted2
 
-    Handles:
-    - IPC with external Engine process (Video/Decoding)
-    - Playlist Management
-    - Pitch Shifting (Master Bus)
-    
-    ADDED: Heartbeat mechanism to prevent zombie engine processes.
+    FIX: Added cleanupSharedMemory() to remove stale IPC files on shutdown.
+    FIX: Added engineExePath for macOS terminate fallback.
 
   ==============================================================================
 */
 
 #pragma once
-
+#include <juce_core/juce_core.h>
+#include <juce_events/juce_events.h>
 #include <juce_audio_basics/juce_audio_basics.h>
 #include <juce_audio_formats/juce_audio_formats.h>
-#include <juce_audio_processors/juce_audio_processors.h>
-#include <juce_graphics/juce_graphics.h>
 #include "IPC/SharedMemoryManager.h"
 #include "UI/PlaylistDataStructures.h"
 
+// ==============================================================================
+// REMOTE PLAYER FACADE
+// ==============================================================================
 class RemotePlayerFacade
 {
 public:
-    RemotePlayerFacade(SharedMemoryManager& m) : ipc(m) {}
+    RemotePlayerFacade(SharedMemoryManager& manager) : ipc(manager) {}
 
-    bool isPlaying() const { return status.playing; }
-    bool hasFinished() const { return status.finished; } 
-    // Window status
-    bool isWindowOpen() const { return status.winOpen; }
-    
-    float getPosition() const { return status.pos; }
-    int64_t getLengthMs() const { return status.len; }
-
-    juce::Image getCurrentVideoFrame() { return juce::Image(); }
-
-    void play()  { if (ipc.isConnected()) send("play"); }
-    void pause() { if (ipc.isConnected()) send("pause"); }
-    void stop()  { if (ipc.isConnected()) send("stop"); }
-    void setVolume(float v) { if (ipc.isConnected()) send("volume", "val", v); }
-    void setRate(float r)   { if (ipc.isConnected()) send("rate", "val", r); }
-    void setPosition(float p) { if (ipc.isConnected()) send("seek", "pos", p); }
-
-    void updateStatus() { if (ipc.isConnected()) status = ipc.getEngineStatus(); }
-    
-    bool loadFile(const juce::String& path) {
-        if (!ipc.isConnected()) return false;
+    void loadFile(const juce::String& path, float vol = 1.0f, float rate = 1.0f)
+    {
         juce::DynamicObject::Ptr o = new juce::DynamicObject();
         o->setProperty("type", "load");
         o->setProperty("path", path);
-        o->setProperty("vol", 1.0f);
-        o->setProperty("speed", 1.0f);
+        o->setProperty("vol", vol);
+        o->setProperty("speed", rate);
         ipc.sendCommand(juce::JSON::toString(juce::var(o.get())));
-        return true;
     }
+
+    void play()     { send("play"); }
+    void pause()    { send("pause"); }
+    void stop()     { send("stop"); }
+
+    void setPosition(float pos) { send("seek", "pos", pos); }
+    void setVolume(float v)     { send("volume", "val", v); }
+    void setRate(float r)       { send("rate", "val", r); }
+
+    void updateStatus()
+    {
+        status = ipc.getEngineStatus();
+    }
+
+    bool isPlaying()   const { return status.playing; }
+    bool hasFinished()  const { return status.finished; }
+    bool isWindowOpen() const { return status.winOpen; }
+    float getPosition() const { return status.pos; }
+    int64_t getLengthMs() const { return status.len; }
 
 private:
     SharedMemoryManager& ipc;
@@ -106,6 +103,7 @@ public:
 private:
     void launchEngine();
     void terminateEngine();
+    void cleanupSharedMemory();
     void handleMidi(juce::MidiBuffer& midiMessages);
     void timerCallback() override;
     void sendHeartbeat();
@@ -125,6 +123,7 @@ private:
     SharedMemoryManager ipc { SharedMemoryManager::Mode::Plugin_Client };
     std::unique_ptr<RemotePlayerFacade> remotePlayer;
     juce::ChildProcess engineProcess;
+    juce::String engineExePath;  // FIX: Store path for macOS terminate fallback
     
     std::vector<PlaylistItem> playlist;
     int startupRetries = 0;

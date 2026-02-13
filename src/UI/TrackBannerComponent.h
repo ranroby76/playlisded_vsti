@@ -5,6 +5,9 @@
 #include "StyledSlider.h"
 #include "LongPressDetector.h"
 
+// ==============================================================================
+// PlayTriangleButton (unique to TrackBanner)
+// ==============================================================================
 class PlayTriangleButton : public juce::Button
 {
 public:
@@ -21,6 +24,7 @@ public:
     
     void paintButton(juce::Graphics& g, bool shouldDrawButtonAsHighlighted, bool shouldDrawButtonAsDown) override
     {
+        juce::ignoreUnused(shouldDrawButtonAsDown);
         auto bounds = getLocalBounds().toFloat();
         if (isActive) g.setColour(juce::Colour(0xFF335533));
         else g.setColour(juce::Colour(0xFF2A2A2A));
@@ -48,6 +52,9 @@ private:
     bool isActive = false;
 };
 
+// ==============================================================================
+// TrackBannerComponent
+// ==============================================================================
 class TrackBannerComponent : public juce::Component, public LongPressDetector
 {
 public:
