@@ -310,7 +310,27 @@ jobs:
             --apple-id "$APPLE_ID" \
             --password "$APPLE_PASSWORD" \
             --team-id "$TEAM_ID" \
-            --wait
+            --wait \
+            --output-format json | tee notarize_result.json || true
+
+          STATUS=$(python3 -c "import sys,json; print(json.load(open('notarize_result.json')).get('status','Unknown'))" 2>/dev/null || echo "Unknown")
+          ID=$(python3 -c "import sys,json; print(json.load(open('notarize_result.json')).get('id',''))" 2>/dev/null || echo "")
+
+          if [ "$STATUS" != "Accepted" ]; then
+            echo "::error::Notarization failed with status: $STATUS"
+            if [ -n "$ID" ]; then
+              echo "Fetching rejection log..."
+              xcrun notarytool log "$ID" \
+                --apple-id "$APPLE_ID" \
+                --password "$APPLE_PASSWORD" \
+                --team-id "$TEAM_ID" \
+                notarization_log.json || true
+              echo "=== NOTARIZATION LOG ==="
+              cat notarization_log.json
+              echo "========================"
+            fi
+            exit 1
+          fi
 
           xcrun stapler staple "Playlisted2_Installer.pkg"
 
