@@ -1,6 +1,8 @@
 name: Build macOS Installer (VST3/AU/CLAP)
 
 on:
+  push:
+    branches: [ main, master ]
   workflow_dispatch:
 
 env:
