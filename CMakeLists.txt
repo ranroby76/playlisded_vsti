@@ -71,7 +71,7 @@ if(NOT IOS)
 
     if(WIN32)
         add_definitions(-DJUCE_WINDOWS=1)
-        set(VLC_DIR "${PROJECT_ROOT}/vlc-3.0.21")
+        set(VLC_DIR "D:/Workspace/vlc-3.0.21")
         target_include_directories(PlaylistedEngine PRIVATE ${VLC_DIR}/sdk/include)
         target_link_libraries(PlaylistedEngine PRIVATE "${VLC_DIR}/sdk/lib/libvlc.lib" "${VLC_DIR}/sdk/lib/libvlccore.lib" winmm ws2_32 gdi32 ole32 uuid comdlg32 shlwapi)
         add_custom_command(TARGET PlaylistedEngine POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different "${VLC_DIR}/libvlc.dll" "$<TARGET_FILE_DIR:PlaylistedEngine>")
